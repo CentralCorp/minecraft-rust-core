@@ -271,6 +271,7 @@ async fn try_resolve_mojang_jre(
                     category: "Java".to_string(),
                     inline_content: None,
                     executable,
+                    package_id: None,
                 });
             }
         }

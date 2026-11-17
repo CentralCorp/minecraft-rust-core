@@ -120,34 +120,37 @@ impl Launcher {
         )
         .await?;
 
-        let custom_dist_items = bundle_manager
-            .fetch_custom_distribution(downloader.client(), self.options.url.as_deref())
+        let custom_dist = bundle_manager
+            .fetch_custom_distribution_packaged(downloader.client(), self.options.url.as_deref())
             .await?;
 
         let mut all_bundle_items = Vec::with_capacity(
             resolved_java.bundle_files.len()
                 + vanilla_libs.bundle_items.len()
                 + vanilla_assets.len()
-                + custom_dist_items.len(),
+                + custom_dist.items.len(),
         );
         all_bundle_items.extend(resolved_java.bundle_files);
         all_bundle_items.extend(vanilla_libs.bundle_items);
         all_bundle_items.extend(vanilla_assets);
-        all_bundle_items.extend(custom_dist_items.iter().cloned());
+        all_bundle_items.extend(custom_dist.items.iter().cloned());
 
-        // 4. Verify local hashes & download missing/corrupt files atomically before running loader processors
-        let pending_downloads = bundle_manager
-            .check_bundle(&all_bundle_items, &on_event)
+        // 4. Verify local hashes & selectively download direct files + dirty folder ZIP packages
+        //    atomically before running loader processors
+        bundle_manager
+            .sync_bundle(
+                &downloader,
+                &all_bundle_items,
+                &custom_dist.packages,
+                &on_event,
+            )
             .await?;
-        if !pending_downloads.is_empty() {
-            downloader.download_many(pending_downloads, &on_event).await?;
-        }
 
         ensure_executable(&resolved_java.binary_path)?;
 
         // 5. Run safe `verify` cleaner inside `game_dir` when enabled
         if self.options.verify {
-            let mut valid_instance_items = custom_dist_items;
+            let mut valid_instance_items = custom_dist.items;
             if let Some(mcp_path) = self.options.resolved_mcp_path() {
                 valid_instance_items.push(BundleItem {
                     path: mcp_path,
@@ -157,6 +160,7 @@ impl Launcher {
                     category: "MCP".to_string(),
                     inline_content: None,
                     executable: false,
+                    package_id: None,
                 });
             }
             bundle_manager.check_files(&valid_instance_items).await?;
@@ -206,6 +210,17 @@ impl Launcher {
     /// [`LaunchEvent::Data`] and exit code on [`LaunchEvent::Close`], and returns the child OS PID.
     pub async fn launch(&self, on_event: EventCallback) -> CoreResult<u32> {
         let prepared = self.prepare(on_event.clone()).await?;
+        self.spawn_prepared(&prepared, on_event).await
+    }
+
+    /// Spawns an already-[`PreparedLaunch`] Minecraft JVM process, enabling callers (such as
+    /// desktop launchers) to run post-extraction hooks (e.g. optional mod reconciliation) right
+    /// after [`Self::prepare`] and before starting Java.
+    pub async fn spawn_prepared(
+        &self,
+        prepared: &PreparedLaunch,
+        on_event: EventCallback,
+    ) -> CoreResult<u32> {
         let full_args = prepared.full_args();
 
         let redacted_cmd = format_redacted_command(

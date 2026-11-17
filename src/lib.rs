@@ -37,7 +37,7 @@ pub use auth::{
     AccountMeta, AuthAccount, CapeInfo, MinecraftProfile, RoleInfo, SkinInfo, SkinVariant,
     UserInfo, XboxInfo,
 };
-pub use bundle::{BundleItem, BundleManager};
+pub use bundle::{BundleItem, BundleManager, CustomDistribution, PackageDescriptor};
 pub use config::{
     JavaOptions, LaunchOptions, LoaderOptions, LoaderType, MemoryOptions, ScreenOptions,
     ServerConnect,
