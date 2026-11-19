@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
@@ -7,6 +8,9 @@ use tar::Archive;
 use zip::ZipArchive;
 
 use crate::error::CoreResult;
+use crate::utils::hash_cache::clear_readonly_if_exists;
+
+const ARCHIVE_IO_BUF_SIZE: usize = 64 * 1024;
 
 /// Sanitizes an archive entry path to prevent ZipSlip / path-traversal attacks.
 /// Returns `None` if the entry contains parent-directory (`..`) traversal, null bytes, or an empty relative path.
@@ -37,17 +41,69 @@ pub fn sanitize_archive_entry_path(raw: &str) -> Option<PathBuf> {
     }
 }
 
-/// Extracts all files from a `.zip` / `.jar` archive into `dest_dir` safely (blocking call;
-/// run inside `tokio::task::spawn_blocking` for large archives).
+fn copy_reader_to_atomic_dest(
+    reader: &mut impl Read,
+    out_path: &Path,
+    copy_buf: &mut [u8],
+) -> CoreResult<()> {
+    let file_name = out_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("entry");
+    let part_path = out_path.with_file_name(format!(
+        ".{file_name}.{}.part",
+        std::process::id()
+    ));
+
+    let write_res = (|| -> CoreResult<()> {
+        let out_file = File::create(&part_path)?;
+        let mut writer = BufWriter::with_capacity(ARCHIVE_IO_BUF_SIZE, out_file);
+        loop {
+            let n = reader.read(copy_buf)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&copy_buf[..n])?;
+        }
+        writer.flush()?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&part_path);
+        return Err(err);
+    }
+
+    clear_readonly_if_exists(out_path);
+    #[cfg(windows)]
+    if out_path.exists() {
+        let _ = fs::remove_file(out_path);
+    }
+
+    if let Err(err) = fs::rename(&part_path, out_path) {
+        let _ = fs::remove_file(&part_path);
+        return Err(err.into());
+    }
+
+    Ok(())
+}
+
+/// Extracts all files from a `.zip` / `.jar` archive into `dest_dir` safely using `64 KiB`
+/// buffered I/O, deduplicated parent directory creation, and atomic `.part` + `rename` writes
+/// (blocking call; run inside `tokio::task::spawn_blocking` for large archives).
 pub fn extract_zip_archive(
     archive_path: &Path,
     dest_dir: &Path,
     skip_meta_inf: bool,
 ) -> CoreResult<Vec<PathBuf>> {
     let file = File::open(archive_path)?;
-    let mut zip = ZipArchive::new(file)?;
+    let reader = BufReader::with_capacity(ARCHIVE_IO_BUF_SIZE, file);
+    let mut zip = ZipArchive::new(reader)?;
     fs::create_dir_all(dest_dir)?;
 
+    let mut created_dirs: HashSet<PathBuf> = HashSet::new();
+    created_dirs.insert(dest_dir.to_path_buf());
+    let mut copy_buf = vec![0u8; ARCHIVE_IO_BUF_SIZE];
     let mut extracted = Vec::new();
 
     for i in 0..zip.len() {
@@ -64,12 +120,16 @@ pub fn extract_zip_archive(
 
         let out_path = dest_dir.join(&rel_path);
         if entry.is_dir() || raw_name.ends_with('/') {
-            fs::create_dir_all(&out_path)?;
+            if created_dirs.insert(out_path.clone()) {
+                fs::create_dir_all(&out_path)?;
+            }
             continue;
         }
 
         if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)?;
+            if created_dirs.insert(parent.to_path_buf()) {
+                fs::create_dir_all(parent)?;
+            }
         }
 
         #[cfg(unix)]
@@ -90,9 +150,7 @@ pub fn extract_zip_archive(
         }
 
         let unix_mode = entry.unix_mode();
-        let mut out_file = File::create(&out_path)?;
-        io::copy(&mut entry, &mut out_file)?;
-        drop(out_file);
+        copy_reader_to_atomic_dest(&mut entry, &out_path, &mut copy_buf)?;
 
         apply_extracted_permissions(&out_path, &rel_path, unix_mode)?;
         extracted.push(out_path);
@@ -102,13 +160,17 @@ pub fn extract_zip_archive(
 }
 
 /// Extracts a `.tar.gz` / `.tgz` archive (such as Azul Zulu JREs on Linux/macOS) into `dest_dir`
-/// safely with anti-traversal protection, symlink handling, and Unix executable bits.
+/// safely with `64 KiB` buffered I/O, anti-traversal protection, symlink handling, and Unix executable bits.
 pub fn extract_tar_gz_archive(archive_path: &Path, dest_dir: &Path) -> CoreResult<Vec<PathBuf>> {
     let file = File::open(archive_path)?;
-    let gz = GzDecoder::new(file);
+    let buf_reader = BufReader::with_capacity(ARCHIVE_IO_BUF_SIZE, file);
+    let gz = GzDecoder::new(buf_reader);
     let mut archive = Archive::new(gz);
     fs::create_dir_all(dest_dir)?;
 
+    let mut created_dirs: HashSet<PathBuf> = HashSet::new();
+    created_dirs.insert(dest_dir.to_path_buf());
+    let mut copy_buf = vec![0u8; ARCHIVE_IO_BUF_SIZE];
     let mut extracted = Vec::new();
 
     for entry_res in archive.entries()? {
@@ -122,12 +184,16 @@ pub fn extract_tar_gz_archive(archive_path: &Path, dest_dir: &Path) -> CoreResul
         let entry_type = entry.header().entry_type();
 
         if entry_type.is_dir() {
-            fs::create_dir_all(&out_path)?;
+            if created_dirs.insert(out_path.clone()) {
+                fs::create_dir_all(&out_path)?;
+            }
             continue;
         }
 
         if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)?;
+            if created_dirs.insert(parent.to_path_buf()) {
+                fs::create_dir_all(parent)?;
+            }
         }
 
         #[cfg(unix)]
@@ -145,9 +211,7 @@ pub fn extract_tar_gz_archive(archive_path: &Path, dest_dir: &Path) -> CoreResul
 
         if entry_type.is_file() {
             let mode = entry.header().mode().ok();
-            let mut out_file = File::create(&out_path)?;
-            io::copy(&mut entry, &mut out_file)?;
-            drop(out_file);
+            copy_reader_to_atomic_dest(&mut entry, &out_path, &mut copy_buf)?;
 
             apply_extracted_permissions(&out_path, &rel_path, mode)?;
             extracted.push(out_path);
@@ -160,7 +224,8 @@ pub fn extract_tar_gz_archive(archive_path: &Path, dest_dir: &Path) -> CoreResul
 /// Reads a single entry from a `.zip` / `.jar` archive into memory, returning `Ok(None)` if absent.
 pub fn read_zip_entry_bytes(archive_path: &Path, entry_name: &str) -> CoreResult<Option<Vec<u8>>> {
     let file = File::open(archive_path)?;
-    let mut zip = ZipArchive::new(file)?;
+    let reader = BufReader::with_capacity(ARCHIVE_IO_BUF_SIZE, file);
+    let mut zip = ZipArchive::new(reader)?;
     let normalized = entry_name.trim_start_matches('/').replace('\\', "/");
 
     for candidate in [entry_name, normalized.as_str()] {
@@ -179,14 +244,21 @@ pub fn read_zip_entry_bytes(archive_path: &Path, entry_name: &str) -> CoreResult
 
 /// Extracts all entries under `prefix` (e.g. `"maven/"`) from `archive_path` into `dest_dir`,
 /// stripping `prefix` from the output relative paths.
+///
+/// Multi-instance safe: skips overwriting existing files whose byte size already matches
+/// `entry.size()`, and writes missing/mismatched files via atomic `.part` + `rename`!
 pub fn extract_zip_prefix_to_dir(
     archive_path: &Path,
     prefix: &str,
     dest_dir: &Path,
 ) -> CoreResult<Vec<PathBuf>> {
     let file = File::open(archive_path)?;
-    let mut zip = ZipArchive::new(file)?;
+    let reader = BufReader::with_capacity(ARCHIVE_IO_BUF_SIZE, file);
+    let mut zip = ZipArchive::new(reader)?;
     let clean_prefix = prefix.trim_start_matches('/').replace('\\', "/");
+
+    let mut created_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut copy_buf = vec![0u8; ARCHIVE_IO_BUF_SIZE];
     let mut extracted = Vec::new();
 
     for i in 0..zip.len() {
@@ -204,12 +276,20 @@ pub fn extract_zip_prefix_to_dir(
         };
 
         let out_path = dest_dir.join(&rel_path);
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)?;
+        if let Ok(meta) = fs::metadata(&out_path) {
+            if meta.is_file() && meta.len() == entry.size() {
+                extracted.push(out_path);
+                continue;
+            }
         }
 
-        let mut out_file = File::create(&out_path)?;
-        io::copy(&mut entry, &mut out_file)?;
+        if let Some(parent) = out_path.parent() {
+            if created_dirs.insert(parent.to_path_buf()) {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        copy_reader_to_atomic_dest(&mut entry, &out_path, &mut copy_buf)?;
         extracted.push(out_path);
     }
 
@@ -221,7 +301,6 @@ pub fn extract_zip_prefix_to_dir(
 /// - RFC 822 / JAR specification 72-byte line continuations (lines starting with a single space `' '`)
 /// - Case-insensitive `Main-Class:` header matching
 pub fn parse_manifest_main_class(manifest_text: &str) -> Option<String> {
-    // Normalize CRLF -> LF, CR -> LF, then unfold continuation lines ("\n ")
     let normalized = manifest_text.replace("\r\n", "\n").replace('\r', "\n");
     let mut unfolded = String::with_capacity(normalized.len());
 
@@ -269,8 +348,10 @@ pub fn ensure_executable(path: &Path) -> CoreResult<()> {
         if path.exists() {
             let mut perms = fs::metadata(path)?.permissions();
             let mode = perms.mode();
-            perms.set_mode(mode | 0o755);
-            fs::set_permissions(path, perms)?;
+            if (mode & 0o111) != 0o111 {
+                perms.set_mode(mode | 0o755);
+                fs::set_permissions(path, perms)?;
+            }
         }
     }
     #[cfg(not(unix))]
@@ -302,9 +383,7 @@ fn apply_extracted_permissions(
 
         let is_exec = archive_mode.map(|m| (m & 0o111) != 0).unwrap_or(false) || in_bin_dir;
         if is_exec {
-            let mode = archive_mode
-                .map(|m| (m & 0o777) | 0o755)
-                .unwrap_or(0o755);
+            let mode = archive_mode.map(|m| (m & 0o777) | 0o755).unwrap_or(0o755);
             fs::set_permissions(out_path, fs::Permissions::from_mode(mode))?;
         }
     }

@@ -6,7 +6,10 @@ use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::auth::{AccountMeta, AuthAccount, MinecraftProfile, RoleInfo, SkinInfo, UserInfo};
+use crate::auth::{
+    parse_auth_json_or_http_error, summarize_non_json_body, AccountMeta, AuthAccount,
+    MinecraftProfile, RoleInfo, SkinInfo, UserInfo,
+};
 use crate::error::{CoreError, CoreResult};
 
 /// Outcome of [`AzAuthClient::login`], cleanly modeling Azuriom 2FA challenges.
@@ -29,39 +32,35 @@ pub struct AzAuthClient {
 }
 
 impl AzAuthClient {
-    /// Creates a new [`AzAuthClient`] from an Azuriom base URL.
+    /// Creates a new [`AzAuthClient`] from an Azuriom base URL, reusing [`crate::shared_http_client()`]
+    /// (with automatic `.no_proxy()` bypass for `localhost` / `127.0.0.1` test endpoints).
     pub fn new(base_url: &str) -> CoreResult<Self> {
-        let trimmed = base_url.trim();
-        if trimmed.is_empty() {
-            return Err(CoreError::InvalidConfig(
-                "AzAuth base URL cannot be empty".to_string(),
-            ));
-        }
+        let parsed = parse_and_validate_azauth_base(base_url)?;
+        let http = if is_loopback_host(parsed.host_str()) {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .read_timeout(Duration::from_secs(15))
+                .tcp_nodelay(true)
+                .user_agent(concat!("minecraft-rust-core/", env!("CARGO_PKG_VERSION")))
+                .no_proxy()
+                .build()?
+        } else {
+            crate::shared_http_client()
+        };
 
-        let mut parsed = Url::parse(trimmed)?;
-        if parsed.scheme() != "http" && parsed.scheme() != "https" {
-            return Err(CoreError::InvalidConfig(format!(
-                "Unsupported URL scheme '{}' for AzAuth",
-                parsed.scheme()
-            )));
-        }
-        parsed.set_query(None);
-        parsed.set_fragment(None);
+        Self::with_client_parsed(parsed, http)
+    }
 
+    /// Creates a new [`AzAuthClient`] from an Azuriom base URL and a caller-supplied [`reqwest::Client`].
+    pub fn with_client(base_url: &str, http: reqwest::Client) -> CoreResult<Self> {
+        let parsed = parse_and_validate_azauth_base(base_url)?;
+        Self::with_client_parsed(parsed, http)
+    }
+
+    fn with_client_parsed(parsed: Url, http: reqwest::Client) -> CoreResult<Self> {
         let clean_base = parsed.as_str().trim_end_matches('/');
         let auth_base_url = format!("{clean_base}/api/auth");
         let skin_base_url = format!("{clean_base}/api/skin-api/skins");
-
-        let mut builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .user_agent("minecraft-rust-core/5.0");
-        if matches!(
-            parsed.host_str(),
-            Some("127.0.0.1") | Some("localhost") | Some("[::1]")
-        ) {
-            builder = builder.no_proxy();
-        }
-        let http = builder.build()?;
 
         Ok(Self {
             http,
@@ -110,7 +109,10 @@ impl AzAuthClient {
             .send()
             .await?;
 
-        let raw: serde_json::Value = resp.json().await.map_err(CoreError::Http)?;
+        let http_status = resp.status();
+        let body_text = resp.text().await.map_err(CoreError::Http)?;
+        let raw =
+            parse_auth_json_or_http_error("Azuriom authentication", http_status, &body_text)?;
 
         let status = raw
             .get("status")
@@ -125,17 +127,24 @@ impl AzAuthClient {
             return Ok(AzAuthLoginResult::Requires2fa);
         }
 
-        if status == "error" || raw.get("access_token").is_none() {
-            let err_reason = if reason.is_empty() {
-                "auth_failed".to_string()
-            } else {
+        if !http_status.is_success() || status == "error" || raw.get("access_token").is_none() {
+            let err_reason = if !reason.is_empty() {
                 reason.to_string()
+            } else if !http_status.is_success() {
+                format!("http_{}", http_status.as_u16())
+            } else {
+                "auth_failed".to_string()
             };
             let err_msg = raw
                 .get("message")
                 .and_then(|v| v.as_str())
-                .unwrap_or("Azuriom authentication failed")
-                .to_string();
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!(
+                        "Azuriom authentication failed (HTTP {})",
+                        http_status.as_u16()
+                    )
+                });
             return Err(CoreError::Auth {
                 reason: err_reason,
                 message: err_msg,
@@ -164,23 +173,38 @@ impl AzAuthClient {
             .send()
             .await?;
 
-        let raw: serde_json::Value = resp.json().await.map_err(CoreError::Http)?;
+        let http_status = resp.status();
+        let body_text = resp.text().await.map_err(CoreError::Http)?;
+        let raw = parse_auth_json_or_http_error("Azuriom verify", http_status, &body_text)?;
+
         let status = raw
             .get("status")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
 
-        if status == "error" || raw.get("access_token").is_none() {
+        if !http_status.is_success() || status == "error" || raw.get("access_token").is_none() {
             let reason = raw
                 .get("reason")
                 .and_then(|v| v.as_str())
-                .unwrap_or("invalid_credentials")
-                .to_string();
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    if !http_status.is_success() {
+                        format!("http_{}", http_status.as_u16())
+                    } else {
+                        "invalid_credentials".to_string()
+                    }
+                });
             let message = raw
                 .get("message")
                 .and_then(|v| v.as_str())
-                .unwrap_or("Azuriom session verification failed")
-                .to_string();
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!(
+                        "Azuriom session verification failed (HTTP {})",
+                        http_status.as_u16()
+                    )
+                });
             return Err(CoreError::Auth { reason, message });
         }
 
@@ -219,8 +243,30 @@ impl AzAuthClient {
     }
 
     /// Uploads a new PNG player skin via `multipart/form-data` to
-    /// `POST {base}/api/skin-api/skins/update`.
+    /// `POST {base}/api/skin-api/skins/update` (defaulting to classic arm model when unspecified).
     pub async fn upload_skin(&self, access_token: &str, png_bytes: &[u8]) -> CoreResult<()> {
+        self.upload_skin_inner(access_token, png_bytes, None).await
+    }
+
+    /// Uploads a new PNG player skin along with arm model `variant` (`"slim"` when `slim == true`,
+    /// `"classic"` when `slim == false`) to `POST {base}/api/skin-api/skins/update`.
+    pub async fn upload_skin_with_variant(
+        &self,
+        access_token: &str,
+        skin_png_bytes: &[u8],
+        slim: bool,
+    ) -> CoreResult<()> {
+        let variant = if slim { "slim" } else { "classic" };
+        self.upload_skin_inner(access_token, skin_png_bytes, Some(variant))
+            .await
+    }
+
+    async fn upload_skin_inner(
+        &self,
+        access_token: &str,
+        png_bytes: &[u8],
+        variant: Option<&str>,
+    ) -> CoreResult<()> {
         if png_bytes.is_empty() {
             return Err(CoreError::InvalidConfig(
                 "Skin PNG payload cannot be empty".to_string(),
@@ -232,9 +278,11 @@ impl AzAuthClient {
             .mime_str("image/png")
             .map_err(|e| CoreError::InvalidConfig(e.to_string()))?;
 
-        let form = Form::new()
-            .text("access_token", access_token.trim().to_string())
-            .part("skin", skin_part);
+        let mut form = Form::new().text("access_token", access_token.trim().to_string());
+        if let Some(v) = variant {
+            form = form.text("variant", v.to_string());
+        }
+        form = form.part("skin", skin_part);
 
         let resp = self
             .http
@@ -254,7 +302,10 @@ impl AzAuthClient {
                         .and_then(|m| m.as_str())
                         .map(str::to_string)
                 })
-                .unwrap_or_else(|| format!("HTTP {status}: {body_text}"));
+                .unwrap_or_else(|| {
+                    let summary = summarize_non_json_body(&body_text);
+                    format!("HTTP {}: {summary}", status.as_u16())
+                });
 
             return Err(CoreError::Auth {
                 reason: "skin_upload_failed".to_string(),
@@ -431,4 +482,28 @@ impl AzAuthClient {
             xbox: None,
         })
     }
+}
+
+fn parse_and_validate_azauth_base(base_url: &str) -> CoreResult<Url> {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return Err(CoreError::InvalidConfig(
+            "AzAuth base URL cannot be empty".to_string(),
+        ));
+    }
+
+    let mut parsed = Url::parse(trimmed)?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(CoreError::InvalidConfig(format!(
+            "Unsupported URL scheme '{}' for AzAuth",
+            parsed.scheme()
+        )));
+    }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Ok(parsed)
+}
+
+pub(crate) fn is_loopback_host(host: Option<&str>) -> bool {
+    matches!(host, Some("127.0.0.1") | Some("localhost") | Some("[::1]"))
 }

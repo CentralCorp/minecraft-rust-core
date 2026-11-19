@@ -256,6 +256,25 @@ pub fn collect_vanilla_libraries(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+struct NativeJarStampEntry {
+    path: String,
+    size: u64,
+    mtime_secs: i64,
+    mtime_nanos: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+struct NativesStampFile {
+    version: u32,
+    jars: Vec<NativeJarStampEntry>,
+    #[serde(default)]
+    extracted_files: Vec<String>,
+}
+
+const NATIVES_STAMP_VERSION: u32 = 1;
+const NATIVES_STAMP_FILENAME: &str = ".natives.json";
+
 /// Ensures `<root>/versions/<id>/natives` exists (always required by `-Djna.tmpdir` / LWJGL extract
 /// path) and extracts all native shared libraries from `native_jars` excluding `META-INF`.
 pub async fn extract_natives(
@@ -265,10 +284,22 @@ pub async fn extract_natives(
     on_event: &EventCallback,
 ) -> CoreResult<PathBuf> {
     let natives_dir = root_dir.join("versions").join(version_id).join("natives");
-    fs::create_dir_all(&natives_dir).await?;
+    extract_natives_to(&natives_dir, native_jars, on_event).await
+}
+
+/// Ensures `natives_dir` exists (e.g. `<game_dir>/natives` for isolated multi-instance safety or
+/// `<root>/versions/<id>/natives` otherwise) and extracts native shared libraries from `native_jars`
+/// excluding `META-INF`, using `<natives_dir>/.natives.json` (`path + size + mtime`) so warm
+/// launches skip re-extracting unchanged `.dll`/`.so`/`.dylib` files.
+pub async fn extract_natives_to(
+    natives_dir: &Path,
+    native_jars: &[PathBuf],
+    on_event: &EventCallback,
+) -> CoreResult<PathBuf> {
+    fs::create_dir_all(natives_dir).await?;
 
     if native_jars.is_empty() {
-        return Ok(natives_dir);
+        return Ok(natives_dir.to_path_buf());
     }
 
     let jars_vec: Vec<PathBuf> = native_jars
@@ -277,22 +308,94 @@ pub async fn extract_natives(
         .cloned()
         .collect();
     if jars_vec.is_empty() {
-        return Ok(natives_dir);
+        return Ok(natives_dir.to_path_buf());
     }
 
-    on_event(LaunchEvent::Extract {
-        message: format!("Extracting {} native library archives...", jars_vec.len()),
-    });
+    let target_dir = natives_dir.to_path_buf();
+    let cb = std::sync::Arc::clone(on_event);
 
-    let target_dir = natives_dir.clone();
     tokio::task::spawn_blocking(move || -> CoreResult<()> {
+        let mut current_jars = Vec::with_capacity(jars_vec.len());
         for jar in &jars_vec {
-            extract_zip_archive(jar, &target_dir, true)?;
+            let meta = std::fs::metadata(jar)?;
+            let (size, mtime_secs, mtime_nanos) =
+                crate::utils::hash_cache::metadata_fingerprint(&meta)
+                    .unwrap_or((meta.len(), 0, 0));
+            current_jars.push(NativeJarStampEntry {
+                path: crate::utils::hash_cache::normalize_cache_path_key(jar),
+                size,
+                mtime_secs,
+                mtime_nanos,
+            });
         }
+        current_jars.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let stamp_path = target_dir.join(NATIVES_STAMP_FILENAME);
+        if is_natives_stamp_valid(&target_dir, &stamp_path, &current_jars) {
+            return Ok(());
+        }
+
+        cb(LaunchEvent::Extract {
+            message: format!("Extracting {} native library archives...", jars_vec.len()),
+        });
+
+        let mut all_extracted = Vec::new();
+        for jar in &jars_vec {
+            let extracted_paths = extract_zip_archive(jar, &target_dir, true)?;
+            for p in extracted_paths {
+                if let Ok(rel) = p.strip_prefix(&target_dir) {
+                    let rel_str = rel.to_string_lossy().replace('\\', "/");
+                    if !rel_str.is_empty() && rel_str != NATIVES_STAMP_FILENAME {
+                        all_extracted.push(rel_str);
+                    }
+                }
+            }
+        }
+        all_extracted.sort();
+        all_extracted.dedup();
+
+        let stamp = NativesStampFile {
+            version: NATIVES_STAMP_VERSION,
+            jars: current_jars,
+            extracted_files: all_extracted,
+        };
+        if let Ok(serialized) = serde_json::to_vec(&stamp) {
+            let tmp_stamp = target_dir.join(format!(
+                ".natives.json.{}.tmp",
+                std::process::id()
+            ));
+            if std::fs::write(&tmp_stamp, &serialized).is_ok() {
+                crate::utils::hash_cache::clear_readonly_if_exists(&stamp_path);
+                let _ = std::fs::rename(&tmp_stamp, &stamp_path);
+            } else {
+                let _ = std::fs::remove_file(&tmp_stamp);
+            }
+        }
+
         Ok(())
     })
     .await
     .map_err(|e| CoreError::Other(format!("Native extraction task panicked: {e}")))??;
 
-    Ok(natives_dir)
+    Ok(natives_dir.to_path_buf())
+}
+
+fn is_natives_stamp_valid(
+    natives_dir: &Path,
+    stamp_path: &Path,
+    current_jars: &[NativeJarStampEntry],
+) -> bool {
+    let Ok(bytes) = std::fs::read(stamp_path) else {
+        return false;
+    };
+    let Ok(stamp) = serde_json::from_slice::<NativesStampFile>(&bytes) else {
+        return false;
+    };
+    if stamp.version != NATIVES_STAMP_VERSION || stamp.jars != current_jars {
+        return false;
+    }
+    stamp
+        .extracted_files
+        .iter()
+        .all(|rel| natives_dir.join(rel).is_file())
 }

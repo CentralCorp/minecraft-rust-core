@@ -4,15 +4,17 @@ use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::process::Command;
 
 use crate::error::{CoreError, CoreResult};
 use crate::events::{EventCallback, LaunchEvent};
+use crate::utils::hash_cache::FileHashCache;
 use crate::utils::maven::MavenArtifact;
 use crate::utils::zip_extract::{
     read_jar_main_class, read_zip_entry_bytes, sanitize_archive_entry_path,
 };
+use crate::utils::{exit_status_code, read_lossy_line};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstallDataEntry {
@@ -113,10 +115,20 @@ fn resolve_token_inner(
                         .to_library_path(ctx.libraries_dir);
                     let src_path = Path::new(&resolved);
                     if src_path.exists() && src_path != lzma_dest {
-                        if let Some(parent) = lzma_dest.parent() {
-                            let _ = std::fs::create_dir_all(parent);
+                        let same_len = std::fs::metadata(&lzma_dest)
+                            .ok()
+                            .and_then(|dst_m| {
+                                std::fs::metadata(src_path)
+                                    .ok()
+                                    .map(|src_m| dst_m.len() == src_m.len())
+                            })
+                            .unwrap_or(false);
+                        if !same_len {
+                            if let Some(parent) = lzma_dest.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            let _ = std::fs::copy(src_path, &lzma_dest);
                         }
-                        let _ = std::fs::copy(src_path, &lzma_dest);
                     }
                 }
             }
@@ -212,16 +224,15 @@ fn extract_installer_data_entry(
     entry_path: &str,
     ctx: &PatchContext<'_>,
 ) -> CoreResult<Option<PathBuf>> {
-    if !ctx.installer_jar.exists() {
-        return Ok(None);
-    }
-
     let Some(rel_path) = sanitize_archive_entry_path(entry_path) else {
         return Ok(None);
     };
     let dest = ctx.loader_dir.join("extracted").join(&rel_path);
     if dest.exists() {
         return Ok(Some(dest));
+    }
+    if !ctx.installer_jar.exists() {
+        return Ok(None);
     }
 
     let Some(bytes) = read_zip_entry_bytes(ctx.installer_jar, entry_path)? else {
@@ -234,8 +245,9 @@ fn extract_installer_data_entry(
     Ok(Some(dest))
 }
 
-/// Checks whether all client `processors` have already been run successfully for this `loader_dir`
-/// and all expected output artifacts still exist on disk.
+/// Checks whether all client `processors` have already been run successfully for this `loader_dir`,
+/// all expected `--output` / `outputs` files still exist on disk, AND every declared
+/// `ProcessorSpec.outputs` SHA-1 matches (via [`FileHashCache`] for 0-disk-read warm checks).
 pub fn is_already_patched(
     processors: &[ProcessorSpec],
     data_map: &HashMap<String, InstallDataEntry>,
@@ -246,21 +258,15 @@ pub fn is_already_patched(
         return false;
     }
 
+    let hash_cache = FileHashCache::load_sync(ctx.root_dir);
+
     for proc_spec in processors {
         if !proc_spec.applies_to_client() {
             continue;
         }
 
-        if let Some(ref outputs) = proc_spec.outputs {
-            for key in outputs.keys() {
-                if let Ok(resolved_out) = resolve_processor_token(key, data_map, ctx) {
-                    if !Path::new(&resolved_out).exists() {
-                        return false;
-                    }
-                } else {
-                    return false;
-                }
-            }
+        if verify_processor_outputs_sync(proc_spec, data_map, ctx, &hash_cache).is_err() {
+            return false;
         }
 
         // Also verify any explicit `--output <file>` target produced by the processor
@@ -270,7 +276,7 @@ pub fn is_already_patched(
                 if let Some(target_raw) = iter.next() {
                     if let Ok(resolved_target) = resolve_processor_token(target_raw, data_map, ctx)
                     {
-                        if !Path::new(&resolved_target).exists() {
+                        if !Path::new(&resolved_target).is_file() {
                             return false;
                         }
                     } else {
@@ -281,11 +287,53 @@ pub fn is_already_patched(
         }
     }
 
+    if hash_cache.is_dirty() {
+        let _ = hash_cache.save_sync();
+    }
+
     true
 }
 
+fn verify_processor_outputs_sync(
+    proc_spec: &ProcessorSpec,
+    data_map: &HashMap<String, InstallDataEntry>,
+    ctx: &PatchContext<'_>,
+    hash_cache: &FileHashCache,
+) -> CoreResult<()> {
+    let Some(ref outputs) = proc_spec.outputs else {
+        return Ok(());
+    };
+
+    for (key_raw, expected_sha_raw) in outputs {
+        let resolved_out = resolve_processor_token(key_raw, data_map, ctx)?;
+        let out_path = Path::new(&resolved_out);
+        if !out_path.is_file() {
+            return Err(CoreError::PatchError(format!(
+                "Missing expected processor output file '{}'",
+                out_path.display()
+            )));
+        }
+
+        let resolved_sha = resolve_processor_token(expected_sha_raw, data_map, ctx)?;
+        let clean_sha = resolved_sha.trim().trim_matches('\'').trim();
+        if clean_sha.len() == 40 && clean_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let actual_sha = hash_cache.verify_or_hash_sync(out_path)?;
+            if !actual_sha.eq_ignore_ascii_case(clean_sha) {
+                return Err(CoreError::HashMismatch {
+                    path: out_path.display().to_string(),
+                    expected: clean_sha.to_string(),
+                    actual: actual_sha,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Runs all client-side `processors` sequentially via `tokio::process::Command::new(java_bin)`
-/// WITHOUT invoking a shell (`cmd`/`sh`), streaming output lines as [`LaunchEvent::Patch`].
+/// WITHOUT invoking a shell (`cmd`/`sh`), streaming lossy UTF-8 output lines as [`LaunchEvent::Patch`],
+/// checking Unix signal termination codes, and verifying `ProcessorSpec.outputs` SHA-1 checksums.
 pub async fn run_processors(
     processors: &[ProcessorSpec],
     data_map: &HashMap<String, InstallDataEntry>,
@@ -314,6 +362,7 @@ pub async fn run_processors(
         let _ = fs::remove_file(&marker).await;
     }
 
+    let hash_cache = FileHashCache::load(ctx.root_dir).await;
     let cp_sep = if cfg!(windows) { ";" } else { ":" };
     let total = client_processors.len();
 
@@ -401,8 +450,9 @@ pub async fn run_processors(
         let out_handle = tokio::spawn(async move {
             let mut tail = Vec::new();
             if let Some(out) = stdout {
-                let mut lines = BufReader::new(out).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                let mut reader = BufReader::new(out);
+                let mut buf = Vec::with_capacity(1024);
+                while let Ok(Some(line)) = read_lossy_line(&mut reader, &mut buf).await {
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
                         cb_out(LaunchEvent::Patch {
@@ -422,8 +472,9 @@ pub async fn run_processors(
         let err_handle = tokio::spawn(async move {
             let mut tail = Vec::new();
             if let Some(err) = stderr {
-                let mut lines = BufReader::new(err).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                let mut reader = BufReader::new(err);
+                let mut buf = Vec::with_capacity(1024);
+                while let Ok(Some(line)) = read_lossy_line(&mut reader, &mut buf).await {
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
                         cb_err(LaunchEvent::Patch {
@@ -450,7 +501,7 @@ pub async fn run_processors(
         let err_tail = err_handle.await.unwrap_or_default();
 
         if !status.success() {
-            let code = status.code().unwrap_or(-1);
+            let code = exit_status_code(&status);
             let combined_tail = err_tail
                 .into_iter()
                 .chain(out_tail)
@@ -461,8 +512,12 @@ pub async fn run_processors(
                 proc_spec.jar
             )));
         }
+
+        // Verify declared `ProcessorSpec.outputs` SHA-1 checksums immediately after execution
+        verify_processor_outputs_sync(proc_spec, data_map, ctx, &hash_cache)?;
     }
 
+    hash_cache.save().await?;
     fs::write(&marker, b"ok\n").await?;
     Ok(())
 }

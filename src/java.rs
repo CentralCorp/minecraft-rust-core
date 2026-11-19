@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use crate::bundle::BundleItem;
@@ -16,6 +17,16 @@ use crate::utils::zip_extract::{
 const MOJANG_JAVA_MANIFEST_URL: &str =
     "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 const AZUL_ZULU_API_URL: &str = "https://api.azul.com/metadata/v1/zulu/packages/";
+const CACHED_JRE_MANIFEST_FILENAME: &str = ".jre_manifest.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedMojangJreManifest {
+    #[serde(default)]
+    component: String,
+    #[serde(default)]
+    version_name: String,
+    manifest: serde_json::Value,
+}
 
 /// Result of Java runtime resolution.
 #[derive(Debug, Clone)]
@@ -27,29 +38,67 @@ pub struct ResolvedJava {
     pub bundle_files: Vec<BundleItem>,
 }
 
+/// Parses a Java version string such as `"8"`, `"1.8"`, `"1.8.0_402"`, `"17.0.10"`, or
+/// `"21.0.3+9-LTS"` into its canonical major version (`8`, `17`, `21`, ...).
+pub fn parse_java_major_version(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let cleaned = trimmed
+        .strip_prefix("java-")
+        .or_else(|| trimmed.strip_prefix("jdk-"))
+        .or_else(|| trimmed.strip_prefix("jre-"))
+        .unwrap_or(trimmed);
+
+    if let Some(after_one) = cleaned.strip_prefix("1.") {
+        let digits: String = after_one
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let major = digits.parse::<u32>().ok()?;
+        return (major >= 5).then_some(major);
+    }
+
+    let digits: String = cleaned.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let major = digits.parse::<u32>().ok()?;
+    (major >= 5).then_some(major)
+}
+
 /// Resolves or downloads an appropriate Java runtime for the target Minecraft version:
-/// 1. Uses explicit `options.java.path` if configured.
+/// 1. Uses explicit `options.java.path` if configured (validating system Java major version if
+///    `options.java.version` is also set).
 /// 2. Queries Mojang's official Java Runtime manifest (`windows-x64/x86/arm64`,
 ///    `mac-os/mac-os-arm64` respecting `intel_enabled_mac`, `linux/linux-i386`) when no custom
-///    Java major version override is requested.
-/// 3. Falls back to Azul Zulu's Metadata API (`.zip` / `.tar.gz` extraction, macOS `.jre/Contents/Home/bin/java`
-///    resolution, and Unix `0o755` executable bits).
+///    Java major version override is requested, caching `<runtime_base>/.jre_manifest.json` so
+///    warm launches make 0 Mojang JRE HTTP requests.
+/// 3. Falls back to Azul Zulu's Metadata API (`.zip` / `.tar.gz` extraction, automatic `jre` -> `jdk`
+///    fallback, macOS `.jre/Contents/Home/bin/java` resolution, and Unix `0o755` executable bits).
 pub async fn resolve_java_runtime(
     options: &LaunchOptions,
     mc_version_json: &serde_json::Value,
     downloader: &Downloader,
     on_event: &EventCallback,
 ) -> CoreResult<ResolvedJava> {
+    let forced_major_str = options
+        .java
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let forced_major = forced_major_str.and_then(parse_java_major_version);
+
     // 1. Explicit custom Java path (or `"system"` when `embedded_java == false`)
     if let Some(ref custom_path) = options.java.path {
         if custom_path == Path::new("system") {
-            if let Some(sys_bin) = locate_system_java_binary() {
+            if let Some(sys_bin) = locate_system_java_binary(forced_major) {
                 return Ok(ResolvedJava {
                     binary_path: sys_bin,
                     bundle_files: Vec::new(),
                 });
             }
-            // Host has no system Java on JAVA_HOME / PATH -> fall back seamlessly to embedded JRE
+            // Host has no matching system Java on JAVA_HOME / PATH -> fall back seamlessly to embedded JRE
         } else {
             let resolved_bin = locate_java_binary_in_custom_path(custom_path)?;
             return Ok(ResolvedJava {
@@ -59,24 +108,27 @@ pub async fn resolve_java_runtime(
         }
     }
 
-    let forced_major = options
-        .java
-        .version
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let manifest_major = mc_version_json
+        .get("javaVersion")
+        .and_then(|jv| jv.get("majorVersion"))
+        .and_then(|m| m.as_u64())
+        .map(|m| m as u32);
 
     // 2. Mojang official curated Java Runtime Manifest (when no forced version is set)
-    if forced_major.is_none() {
+    if forced_major_str.is_none() {
         let component = mc_version_json
             .get("javaVersion")
             .and_then(|jv| jv.get("component"))
             .and_then(|c| c.as_str())
             .unwrap_or("jre-legacy");
 
-        if let Some(arch_os_key) =
-            mojang_runtime_platform_key(TargetOs::current(), TargetArch::current(), options.intel_enabled_mac)
-        {
+        let expected_major = manifest_major.or_else(|| infer_mojang_component_major(component));
+
+        if let Some(arch_os_key) = mojang_runtime_platform_key(
+            TargetOs::current(),
+            TargetArch::current(),
+            options.intel_enabled_mac,
+        ) {
             match try_resolve_mojang_jre(
                 &options.path,
                 arch_os_key,
@@ -87,8 +139,13 @@ pub async fn resolve_java_runtime(
             {
                 Ok(Some(resolved)) => return Ok(resolved),
                 Ok(None) | Err(_) => {
-                    // Offline check: reuse an already-installed Mojang JRE in `<path>/runtime/` if present
-                    if let Some(local_bin) = find_cached_mojang_jre(&options.path, arch_os_key) {
+                    // Offline check: reuse an already-installed Mojang JRE matching component / major version
+                    if let Some(local_bin) = find_cached_mojang_jre(
+                        &options.path,
+                        arch_os_key,
+                        Some(component),
+                        expected_major,
+                    ) {
                         return Ok(ResolvedJava {
                             binary_path: local_bin,
                             bundle_files: Vec::new(),
@@ -100,16 +157,7 @@ pub async fn resolve_java_runtime(
     }
 
     // 3. Fallback to Azul Zulu API
-    let major_version = forced_major
-        .and_then(|v| v.parse::<u32>().ok())
-        .or_else(|| {
-            mc_version_json
-                .get("javaVersion")
-                .and_then(|jv| jv.get("majorVersion"))
-                .and_then(|m| m.as_u64())
-                .map(|m| m as u32)
-        })
-        .unwrap_or(8);
+    let major_version = forced_major.or(manifest_major).unwrap_or(8);
 
     resolve_azul_zulu_jre(options, major_version, downloader, on_event).await
 }
@@ -138,12 +186,47 @@ pub fn mojang_runtime_platform_key(
     }
 }
 
+fn infer_mojang_component_major(component: &str) -> Option<u32> {
+    match component.trim() {
+        "jre-legacy" => Some(8),
+        "java-runtime-alpha" => Some(16),
+        "java-runtime-beta" | "java-runtime-gamma" | "java-runtime-gamma-snapshot" => Some(17),
+        "java-runtime-delta" => Some(21),
+        _ => None,
+    }
+}
+
 async fn try_resolve_mojang_jre(
     root_path: &Path,
     arch_os: &str,
     component: &str,
     http: &reqwest::Client,
 ) -> CoreResult<Option<ResolvedJava>> {
+    let safe_component = component.replace(['/', '\\', ':', ' '], "_");
+    let runtime_base = root_path
+        .join("runtime")
+        .join(format!("jre-{safe_component}-{arch_os}"));
+    let cached_manifest_path = runtime_base.join(CACHED_JRE_MANIFEST_FILENAME);
+
+    // Zero-HTTP warm fast-path: reconstruct `ResolvedJava` from `<runtime_base>/.jre_manifest.json`
+    // when already cached on disk (BundleManager + FileHashCache still verify all JRE files!).
+    if cached_manifest_path.is_file() {
+        if let Ok(raw_bytes) = fs::read(&cached_manifest_path).await {
+            let manifest_val_opt = serde_json::from_slice::<CachedMojangJreManifest>(&raw_bytes)
+                .map(|w| w.manifest)
+                .ok()
+                .or_else(|| serde_json::from_slice::<serde_json::Value>(&raw_bytes).ok());
+
+            if let Some(manifest_json) = manifest_val_opt {
+                if let Some(resolved) =
+                    build_resolved_java_from_mojang_manifest(&runtime_base, &manifest_json).await
+                {
+                    return Ok(Some(resolved));
+                }
+            }
+        }
+    }
+
     let all_json: serde_json::Value = http
         .get(MOJANG_JAVA_MANIFEST_URL)
         .send()
@@ -161,13 +244,12 @@ async fn try_resolve_mojang_jre(
         return Ok(None);
     };
 
-    let Some(version_name) = entry
+    let version_name = entry
         .get("version")
         .and_then(|v| v.get("name"))
         .and_then(|n| n.as_str())
-    else {
-        return Ok(None);
-    };
+        .unwrap_or(component)
+        .to_string();
 
     let Some(manifest_url) = entry
         .get("manifest")
@@ -185,9 +267,40 @@ async fn try_resolve_mojang_jre(
         .json()
         .await?;
 
-    let Some(files_map) = manifest_json.get("files").and_then(|f| f.as_object()) else {
+    let Some(resolved) =
+        build_resolved_java_from_mojang_manifest(&runtime_base, &manifest_json).await
+    else {
         return Ok(None);
     };
+
+    // Persist `.jre_manifest.json` atomically so subsequent warm launches skip both Mojang JRE HTTP requests
+    let _ = fs::create_dir_all(&runtime_base).await;
+    let cached_payload = CachedMojangJreManifest {
+        component: component.to_string(),
+        version_name,
+        manifest: manifest_json,
+    };
+    if let Ok(serialized) = serde_json::to_vec(&cached_payload) {
+        let tmp_path = runtime_base.join(format!(
+            ".jre_manifest.json.{}.tmp",
+            std::process::id()
+        ));
+        if fs::write(&tmp_path, &serialized).await.is_ok() {
+            crate::utils::hash_cache::clear_readonly_if_exists(&cached_manifest_path);
+            let _ = fs::rename(&tmp_path, &cached_manifest_path).await;
+        } else {
+            let _ = fs::remove_file(&tmp_path).await;
+        }
+    }
+
+    Ok(Some(resolved))
+}
+
+async fn build_resolved_java_from_mojang_manifest(
+    runtime_base: &Path,
+    manifest_json: &serde_json::Value,
+) -> Option<ResolvedJava> {
+    let files_map = manifest_json.get("files").and_then(|f| f.as_object())?;
 
     // Identify prefix before `bin/java` or `bin/java.exe` / `bin/javaw.exe` (e.g. `jre.bundle/Contents/Home/` on macOS)
     let exe_candidates: &[&str] = if cfg!(windows) {
@@ -210,16 +323,10 @@ async fn try_resolve_mojang_jre(
         }
     }
 
-    let Some(exe_rel) = chosen_exe_rel else {
-        return Ok(None);
-    };
-
-    let safe_ver = version_name.replace(['/', '\\', ':', ' '], "_");
-    let runtime_base = root_path
-        .join("runtime")
-        .join(format!("jre-{safe_ver}-{arch_os}"));
+    let exe_rel = chosen_exe_rel?;
 
     let mut bundle_files = Vec::with_capacity(files_map.len());
+    let mut dir_paths: Vec<PathBuf> = Vec::new();
     #[allow(unused_mut)]
     let mut pending_symlinks: Vec<(PathBuf, String)> = Vec::new();
 
@@ -237,7 +344,7 @@ async fn try_resolve_mojang_jre(
 
         match entry_type {
             "directory" => {
-                let _ = fs::create_dir_all(&dest).await;
+                dir_paths.push(dest);
             }
             "link" => {
                 if let Some(target) = info.get("target").and_then(|t| t.as_str()) {
@@ -277,22 +384,37 @@ async fn try_resolve_mojang_jre(
         }
     }
 
-    #[cfg(unix)]
-    for (link_path, target_str) in pending_symlinks {
-        let target_pb = PathBuf::from(&target_str);
-        if !target_pb.is_absolute() {
-            if let Some(parent) = link_path.parent() {
-                let _ = fs::create_dir_all(parent).await;
+    if !dir_paths.is_empty() || !pending_symlinks.is_empty() {
+        let _ = tokio::task::spawn_blocking(move || {
+            for d in dir_paths {
+                if !d.exists() {
+                    let _ = std::fs::create_dir_all(&d);
+                }
             }
-            let _ = std::fs::remove_file(&link_path);
-            let _ = std::os::unix::fs::symlink(&target_pb, &link_path);
-        }
+            #[cfg(unix)]
+            for (link_path, target_str) in pending_symlinks {
+                let target_pb = PathBuf::from(&target_str);
+                if !target_pb.is_absolute() {
+                    if let Ok(existing_target) = std::fs::read_link(&link_path) {
+                        if existing_target == target_pb {
+                            continue;
+                        }
+                    }
+                    if let Some(parent) = link_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::remove_file(&link_path);
+                    let _ = std::os::unix::fs::symlink(&target_pb, &link_path);
+                }
+            }
+        })
+        .await;
     }
 
-    Ok(Some(ResolvedJava {
+    Some(ResolvedJava {
         binary_path: runtime_base.join(exe_rel),
         bundle_files,
-    }))
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -350,31 +472,41 @@ async fn resolve_azul_zulu_jre(
         TargetOs::Linux => &["tar.gz", "zip"],
     };
 
-    let pkg_type = if options.java.image_type.trim().is_empty() {
+    let requested_pkg_type = if options.java.image_type.trim().is_empty() {
         "jre"
     } else {
         options.java.image_type.trim()
     };
 
+    // If `jre` returns no builds on Azul's API (common on certain arch/version combinations),
+    // automatically fall back to `jdk`!
+    let pkg_types_to_try: Vec<&str> = if requested_pkg_type.eq_ignore_ascii_case("jre") {
+        vec!["jre", "jdk"]
+    } else {
+        vec![requested_pkg_type]
+    };
+
     let mut chosen_pkg: Option<(ZuluPackage, &'static str)> = None;
-    for &archive_ext in archive_types {
-        let query_url = format!(
-            "{AZUL_ZULU_API_URL}?java_version={major_version}&os={zulu_os}&arch={zulu_arch}&archive_type={archive_ext}&java_package_type={pkg_type}&latest=true&release_status=ga&availability_types=CA"
-        );
-        let resp = downloader.client().get(&query_url).send().await?;
-        if !resp.status().is_success() {
-            continue;
-        }
-        let pkgs: Vec<ZuluPackage> = resp.json().await.unwrap_or_default();
-        if let Some(first) = pkgs.into_iter().next() {
-            chosen_pkg = Some((first, archive_ext));
-            break;
+    'pkg_loop: for pkg_type in &pkg_types_to_try {
+        for &archive_ext in archive_types {
+            let query_url = format!(
+                "{AZUL_ZULU_API_URL}?java_version={major_version}&os={zulu_os}&arch={zulu_arch}&archive_type={archive_ext}&java_package_type={pkg_type}&latest=true&release_status=ga&availability_types=CA"
+            );
+            let resp = downloader.client().get(&query_url).send().await?;
+            if !resp.status().is_success() {
+                continue;
+            }
+            let pkgs: Vec<ZuluPackage> = resp.json().await.unwrap_or_default();
+            if let Some(first) = pkgs.into_iter().next() {
+                chosen_pkg = Some((first, archive_ext));
+                break 'pkg_loop;
+            }
         }
     }
 
     let Some((pkg, archive_ext)) = chosen_pkg else {
         return Err(CoreError::JavaNotFound(format!(
-            "No Azul Zulu {pkg_type} package found for Java {major_version} on {zulu_os}/{zulu_arch}"
+            "No Azul Zulu {requested_pkg_type} (or jdk fallback) package found for Java {major_version} on {zulu_os}/{zulu_arch}"
         )));
     };
 
@@ -486,17 +618,27 @@ fn locate_java_binary_in_custom_path(custom: &Path) -> CoreResult<PathBuf> {
     )))
 }
 
-fn locate_system_java_binary() -> Option<PathBuf> {
+fn locate_system_java_binary(required_major: Option<u32>) -> Option<PathBuf> {
+    let matches_major = |candidate: &Path| -> bool {
+        match required_major {
+            None => true,
+            Some(req) => detect_java_binary_major_version(candidate) == Some(req),
+        }
+    };
+
     if let Some(java_home) = std::env::var_os("JAVA_HOME") {
         let home_path = PathBuf::from(java_home);
         if let Some(bin) = find_java_binary_in_dir(&home_path) {
-            let _ = ensure_executable(&bin);
-            return Some(bin);
+            if matches_major(&bin) {
+                let _ = ensure_executable(&bin);
+                return Some(bin);
+            }
         }
     }
 
+    // Prefer `java.exe` consistently so child stdout/stderr log pipes are never suppressed on Windows!
     let bin_names: &[&str] = if cfg!(windows) {
-        &["javaw.exe", "java.exe"]
+        &["java.exe", "javaw.exe"]
     } else {
         &["java"]
     };
@@ -505,7 +647,7 @@ fn locate_system_java_binary() -> Option<PathBuf> {
         for dir in std::env::split_paths(&path_var) {
             for exe in bin_names {
                 let candidate = dir.join(exe);
-                if candidate.is_file() {
+                if candidate.is_file() && matches_major(&candidate) {
                     return Some(candidate);
                 }
             }
@@ -515,20 +657,136 @@ fn locate_system_java_binary() -> Option<PathBuf> {
     None
 }
 
-fn find_cached_mojang_jre(root_path: &Path, arch_os: &str) -> Option<PathBuf> {
-    let runtime_root = root_path.join("runtime");
-    let entries = std::fs::read_dir(&runtime_root).ok()?;
-    let suffix = format!("-{arch_os}");
+fn detect_java_binary_major_version(java_bin: &Path) -> Option<u32> {
+    if let Some(home) = java_bin.parent().and_then(|p| p.parent()) {
+        if let Some(maj) = read_release_file_major(home) {
+            return Some(maj);
+        }
+    }
+    if let Ok(canon) = std::fs::canonicalize(java_bin) {
+        if let Some(home) = canon.parent().and_then(|p| p.parent()) {
+            if let Some(maj) = read_release_file_major(home) {
+                return Some(maj);
+            }
+        }
+    }
 
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("jre-") && name.ends_with(&suffix) {
-            if let Some(bin) = find_java_binary_in_dir(&entry.path()) {
-                return Some(bin);
+    let mut cmd = Command::new(java_bin);
+    cmd.arg("-version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = cmd.output().ok()?;
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    for line in combined.lines() {
+        if let Some((_, after_quote)) = line.split_once('"') {
+            if let Some((ver_token, _)) = after_quote.split_once('"') {
+                if let Some(maj) = parse_java_major_version(ver_token) {
+                    return Some(maj);
+                }
+            }
+        }
+        for word in line.split_whitespace() {
+            if word.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                if let Some(maj) = parse_java_major_version(word) {
+                    return Some(maj);
+                }
             }
         }
     }
     None
+}
+
+fn read_release_file_major(java_home: &Path) -> Option<u32> {
+    for candidate in [
+        java_home.join("release"),
+        java_home.join("Contents").join("Home").join("release"),
+    ] {
+        if let Ok(text) = std::fs::read_to_string(&candidate) {
+            for line in text.lines() {
+                if let Some(val) = line.trim().strip_prefix("JAVA_VERSION=") {
+                    if let Some(maj) = parse_java_major_version(val) {
+                        return Some(maj);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Locates an already-installed Mojang JRE under `<root>/runtime/` when offline, prioritizing:
+/// 1. Exact component directory (`runtime/jre-{component}-{arch_os}`),
+/// 2. Any `runtime/jre-*-{arch_os}` matching `expected_major` (via `<dir>/release` `JAVA_VERSION`
+///    or version directory name), so multi-JRE installs never pick the wrong Java major version!
+pub fn find_cached_mojang_jre(
+    root_path: &Path,
+    arch_os: &str,
+    component: Option<&str>,
+    expected_major: Option<u32>,
+) -> Option<PathBuf> {
+    let runtime_root = root_path.join("runtime");
+    if !runtime_root.is_dir() {
+        return None;
+    }
+
+    if let Some(comp) = component.map(str::trim).filter(|s| !s.is_empty()) {
+        let safe_comp = comp.replace(['/', '\\', ':', ' '], "_");
+        let exact_dir = runtime_root.join(format!("jre-{safe_comp}-{arch_os}"));
+        if let Some(bin) = find_java_binary_in_dir(&exact_dir) {
+            return Some(bin);
+        }
+    }
+
+    let entries = std::fs::read_dir(&runtime_root).ok()?;
+    let suffix = format!("-{arch_os}");
+    let mut fallback_without_major: Option<PathBuf> = None;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("jre-") || !name.ends_with(&suffix) {
+            continue;
+        }
+        let Some(bin) = find_java_binary_in_dir(&path) else {
+            continue;
+        };
+
+        match expected_major {
+            Some(exp_maj) => {
+                let dir_major = read_release_file_major(&path)
+                    .or_else(|| {
+                        bin.parent()
+                            .and_then(|p| p.parent())
+                            .and_then(read_release_file_major)
+                    })
+                    .or_else(|| {
+                        let inner = name
+                            .strip_prefix("jre-")
+                            .and_then(|s| s.strip_suffix(&suffix))?;
+                        infer_mojang_component_major(inner).or_else(|| parse_java_major_version(inner))
+                    });
+
+                if dir_major == Some(exp_maj) {
+                    return Some(bin);
+                }
+            }
+            None => {
+                if fallback_without_major.is_none() {
+                    fallback_without_major = Some(bin);
+                }
+            }
+        }
+    }
+
+    fallback_without_major
 }
 
 /// Searches up to 4 directory levels under `root` for `bin/java` (`bin/java.exe` / `bin/javaw.exe`

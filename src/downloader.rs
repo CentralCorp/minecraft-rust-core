@@ -8,14 +8,16 @@ use futures_util::StreamExt;
 use md5::Md5;
 use sha1::{Digest, Sha1};
 use tokio::fs::{self, File};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Semaphore;
 
 use crate::error::{CoreError, CoreResult};
 use crate::events::{EventCallback, LaunchEvent};
+use crate::utils::hash_cache::{clear_readonly_if_exists, FileHashCache};
 use crate::utils::zip_extract::ensure_executable;
 
-const MAX_RETRIES_PER_FILE: usize = 3;
+const DEFAULT_MAX_RETRIES: usize = 3;
+const WRITE_BUF_CAPACITY: usize = 64 * 1024;
 
 /// Expected cryptographic checksum verified before renaming `.part` -> final destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,39 +50,71 @@ impl DownloadTask {
     }
 }
 
-/// Bounded-concurrency async downloader using `tokio::sync::Semaphore`, atomic `.part` files,
-/// streaming SHA-1/MD5 verification, HTTP `2xx` validation, deduplication by destination path,
-/// and rolling speed / ETA telemetry.
+/// Bounded-concurrency async downloader using `tokio::sync::Semaphore`, `64 KiB` buffered atomic
+/// `.part` files, streaming SHA-1/MD5 verification, HTTP `2xx` validation, deduplication by
+/// destination path, incremental [`FileHashCache`] updates, and rolling speed / ETA telemetry.
 #[derive(Debug, Clone)]
 pub struct Downloader {
     http: reqwest::Client,
     concurrency: usize,
+    max_retries: usize,
     chunk_timeout: Duration,
+    hash_cache: Option<FileHashCache>,
 }
 
 impl Default for Downloader {
     fn default() -> Self {
-        Self::new(5, 10_000)
+        Self::new(12, 10_000)
     }
 }
 
 impl Downloader {
-    /// Creates a new [`Downloader`] with bounded concurrency (`1..=32`) and connect/chunk idle timeout.
+    /// Creates a new [`Downloader`] with bounded concurrency (`1..=64`) and connect/read idle timeout.
     pub fn new(concurrency: usize, timeout_ms: u64) -> Self {
-        let clamped_concurrency = concurrency.clamp(1, 32);
-        let timeout = Duration::from_millis(timeout_ms.max(2_000));
+        let clamped_concurrency = concurrency.clamp(1, 64);
+        let connect_timeout = Duration::from_millis(timeout_ms.max(2_000));
+        let chunk_timeout = connect_timeout.max(Duration::from_secs(30));
 
         let http = reqwest::Client::builder()
-            .connect_timeout(timeout)
-            .user_agent("minecraft-rust-core/5.0")
+            .connect_timeout(connect_timeout)
+            .read_timeout(chunk_timeout)
+            .tcp_nodelay(true)
+            .pool_idle_timeout(Duration::from_secs(60))
+            .user_agent(concat!("minecraft-rust-core/", env!("CARGO_PKG_VERSION")))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| crate::shared_http_client());
 
         Self {
             http,
             concurrency: clamped_concurrency,
-            chunk_timeout: timeout.max(Duration::from_secs(15)),
+            max_retries: DEFAULT_MAX_RETRIES,
+            chunk_timeout,
+            hash_cache: None,
         }
+    }
+
+    /// Creates a [`Downloader`] reusing an existing [`reqwest::Client`] connection pool.
+    pub fn with_client(http: reqwest::Client, concurrency: usize, max_retries: u32) -> Self {
+        Self {
+            http,
+            concurrency: concurrency.clamp(1, 64),
+            max_retries: (max_retries as usize).max(1),
+            chunk_timeout: Duration::from_secs(30),
+            hash_cache: None,
+        }
+    }
+
+    /// Overrides the per-chunk stream idle timeout in milliseconds.
+    pub fn with_chunk_timeout(mut self, timeout_ms: u64) -> Self {
+        self.chunk_timeout = Duration::from_millis(timeout_ms.max(2_000));
+        self
+    }
+
+    /// Attaches a [`FileHashCache`] so every verified download immediately records its
+    /// `(size, mtime_secs, mtime_nanos) -> sha1` entry without re-hashing on the next launch.
+    pub fn with_hash_cache(mut self, hash_cache: FileHashCache) -> Self {
+        self.hash_cache = Some(hash_cache);
+        self
     }
 
     /// Returns a [`Downloader`] configured to bypass environment HTTP proxies (useful for local servers/tests).
@@ -88,7 +122,10 @@ impl Downloader {
         let timeout = self.chunk_timeout;
         self.http = reqwest::Client::builder()
             .connect_timeout(timeout)
-            .user_agent("minecraft-rust-core/5.0")
+            .read_timeout(timeout)
+            .tcp_nodelay(true)
+            .pool_idle_timeout(Duration::from_secs(60))
+            .user_agent(concat!("minecraft-rust-core/", env!("CARGO_PKG_VERSION")))
             .no_proxy()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
@@ -98,6 +135,16 @@ impl Downloader {
     /// Returns a reference to the underlying `reqwest::Client`.
     pub fn client(&self) -> &reqwest::Client {
         &self.http
+    }
+
+    /// Returns the configured maximum concurrent downloads (`1..=64`).
+    pub fn concurrency(&self) -> usize {
+        self.concurrency
+    }
+
+    /// Returns the attached [`FileHashCache`], if any.
+    pub fn hash_cache(&self) -> Option<&FileHashCache> {
+        self.hash_cache.as_ref()
     }
 
     /// Downloads a single file atomically to `destination`, emitting [`LaunchEvent::Progress`].
@@ -110,12 +157,17 @@ impl Downloader {
         let last_emit_ms = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1)));
         let total_hint = task.size.unwrap_or(0);
 
-        self.download_with_retries(task, downloaded, total_hint, last_emit_ms, on_event)
-            .await
+        self.download_with_retries(task, downloaded, total_hint, last_emit_ms, false, on_event)
+            .await?;
+
+        if let Some(ref cache) = self.hash_cache {
+            let _ = cache.save().await;
+        }
+        Ok(())
     }
 
-    /// Downloads a batch of files concurrently, deduplicating identical destination paths first
-    /// to eliminate race conditions on shared asset hashes or duplicated library entries.
+    /// Downloads a batch of files concurrently, deduplicating identical destination paths and
+    /// parent `create_dir_all` calls upfront.
     pub async fn download_many(
         &self,
         tasks: Vec<DownloadTask>,
@@ -126,61 +178,30 @@ impl Downloader {
             return Ok(());
         }
 
+        // Deduplicate parent directory creation across the entire batch before spawning workers
+        let mut unique_parents: HashSet<PathBuf> = HashSet::new();
+        for task in &deduped {
+            if let Some(parent) = task.destination.parent() {
+                if !parent.as_os_str().is_empty() {
+                    unique_parents.insert(parent.to_path_buf());
+                }
+            }
+        }
+        for parent in unique_parents {
+            fs::create_dir_all(&parent).await?;
+        }
+
         let known_total: u64 = deduped.iter().filter_map(|t| t.size).sum();
         let semaphore = Arc::new(Semaphore::new(self.concurrency));
         let downloaded_total = Arc::new(AtomicU64::new(0));
         let total_bytes = Arc::new(AtomicU64::new(known_total));
         let last_progress_emit = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1)));
 
-        // Rolling speed & ETA reporter running every 500ms
-        let ticker_downloaded = Arc::clone(&downloaded_total);
-        let ticker_total = Arc::clone(&total_bytes);
-        let ticker_cb = Arc::clone(on_event);
-        let speed_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(500));
-            interval.tick().await; // consume immediate first tick
-            let mut prev_bytes = 0u64;
-            let mut prev_instant = Instant::now();
-            let mut window: VecDeque<f64> = VecDeque::with_capacity(6);
-
-            loop {
-                interval.tick().await;
-                let now = Instant::now();
-                let dt = now.duration_since(prev_instant).as_secs_f64();
-                if dt <= 0.0 {
-                    continue;
-                }
-                let cur_bytes = ticker_downloaded.load(Ordering::Relaxed);
-                let delta = cur_bytes.saturating_sub(prev_bytes) as f64;
-                prev_bytes = cur_bytes;
-                prev_instant = now;
-
-                if window.len() >= 5 {
-                    window.pop_front();
-                }
-                window.push_back(delta / dt);
-
-                let avg_speed = window.iter().sum::<f64>() / (window.len() as f64);
-                let speed_u64 = avg_speed.round().max(0.0) as u64;
-                ticker_cb(LaunchEvent::Speed {
-                    bytes_per_sec: speed_u64,
-                });
-
-                let tot = ticker_total.load(Ordering::Relaxed);
-                if avg_speed > 1.0 && tot > cur_bytes {
-                    let eta = ((tot - cur_bytes) as f64) / avg_speed;
-                    if eta.is_finite() {
-                        ticker_cb(LaunchEvent::Estimated {
-                            seconds_remaining: eta,
-                        });
-                    }
-                } else if tot > 0 && cur_bytes >= tot {
-                    ticker_cb(LaunchEvent::Estimated {
-                        seconds_remaining: 0.0,
-                    });
-                }
-            }
-        });
+        let speed_handle = spawn_speed_reporter(
+            Arc::clone(&downloaded_total),
+            Arc::clone(&total_bytes),
+            Arc::clone(on_event),
+        );
 
         let mut join_set = tokio::task::JoinSet::new();
 
@@ -198,16 +219,12 @@ impl Downloader {
                     .await
                     .map_err(|e| CoreError::Other(format!("Download semaphore closed: {e}")))?;
 
-                if task.size.unwrap_or(0) == 0 {
-                    // We'll dynamically add Content-Length inside the attempt if task.size was unknown
-                    let _ = &tot_bytes;
-                }
-
                 dl.download_with_retries_shared(
                     &task,
                     &dl_bytes,
                     &tot_bytes,
                     &last_emit,
+                    true,
                     &cb,
                 )
                 .await
@@ -240,6 +257,10 @@ impl Downloader {
 
         speed_handle.abort();
 
+        if let Some(ref cache) = self.hash_cache {
+            let _ = cache.save().await;
+        }
+
         if let Some(err) = first_err {
             return Err(err);
         }
@@ -253,6 +274,28 @@ impl Downloader {
         });
 
         Ok(())
+    }
+
+    /// Internal helper used by pipelined package downloaders to share byte/progress counters
+    /// across independent per-package tasks without aborting sibling packages on single-package failure.
+    pub(crate) async fn download_task_shared(
+        &self,
+        task: &DownloadTask,
+        downloaded_total: &Arc<AtomicU64>,
+        total_bytes: &Arc<AtomicU64>,
+        last_emit: &Arc<Mutex<Instant>>,
+        parent_precreated: bool,
+        on_event: &EventCallback,
+    ) -> CoreResult<()> {
+        self.download_with_retries_shared(
+            task,
+            downloaded_total,
+            total_bytes,
+            last_emit,
+            parent_precreated,
+            on_event,
+        )
+        .await
     }
 
     /// Probes `url` with an HTTP `HEAD` request (falling back to `GET Range: bytes=0-0` when
@@ -309,11 +352,19 @@ impl Downloader {
         downloaded: Arc<AtomicU64>,
         total_hint: u64,
         last_emit: Arc<Mutex<Instant>>,
+        parent_precreated: bool,
         on_event: &EventCallback,
     ) -> CoreResult<()> {
         let total = Arc::new(AtomicU64::new(total_hint));
-        self.download_with_retries_shared(task, &downloaded, &total, &last_emit, on_event)
-            .await
+        self.download_with_retries_shared(
+            task,
+            &downloaded,
+            &total,
+            &last_emit,
+            parent_precreated,
+            on_event,
+        )
+        .await
     }
 
     async fn download_with_retries_shared(
@@ -322,11 +373,13 @@ impl Downloader {
         downloaded_total: &Arc<AtomicU64>,
         total_bytes: &Arc<AtomicU64>,
         last_emit: &Arc<Mutex<Instant>>,
+        parent_precreated: bool,
         on_event: &EventCallback,
     ) -> CoreResult<()> {
         let mut last_error: Option<CoreError> = None;
+        let max_attempts = self.max_retries.max(1);
 
-        for attempt in 1..=MAX_RETRIES_PER_FILE {
+        for attempt in 1..=max_attempts {
             let bytes_added_this_attempt = AtomicU64::new(0);
             let added_total_this_attempt = AtomicU64::new(0);
 
@@ -338,13 +391,13 @@ impl Downloader {
                     &bytes_added_this_attempt,
                     &added_total_this_attempt,
                     last_emit,
+                    parent_precreated,
                     on_event,
                 )
                 .await
             {
                 Ok(()) => return Ok(()),
                 Err(err) => {
-                    // Roll back partial progress from failed attempt before retrying
                     let partial = bytes_added_this_attempt.load(Ordering::Relaxed);
                     if partial > 0 {
                         downloaded_total.fetch_sub(partial, Ordering::Relaxed);
@@ -355,7 +408,7 @@ impl Downloader {
                     }
 
                     last_error = Some(err);
-                    if attempt < MAX_RETRIES_PER_FILE {
+                    if attempt < max_attempts {
                         tokio::time::sleep(Duration::from_millis(250 * (attempt as u64))).await;
                     }
                 }
@@ -378,10 +431,15 @@ impl Downloader {
         bytes_added_this_attempt: &AtomicU64,
         added_total_this_attempt: &AtomicU64,
         last_emit: &Arc<Mutex<Instant>>,
+        parent_precreated: bool,
         on_event: &EventCallback,
     ) -> CoreResult<()> {
-        if let Some(parent) = task.destination.parent() {
-            fs::create_dir_all(parent).await?;
+        if !parent_precreated {
+            if let Some(parent) = task.destination.parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent).await?;
+                }
+            }
         }
 
         let part_path = build_part_path(&task.destination);
@@ -405,26 +463,32 @@ impl Downloader {
             }
         }
 
-        let mut file = File::create(&part_path).await?;
-        let mut sha1_hasher = matches!(task.expected_hash, Some(ExpectedHash::Sha1(_)))
-            .then(Sha1::new);
-        let mut md5_hasher = matches!(task.expected_hash, Some(ExpectedHash::Md5(_)))
-            .then(Md5::new);
+        let file = File::create(&part_path).await?;
+        let mut writer = BufWriter::with_capacity(WRITE_BUF_CAPACITY, file);
+        let need_sha1 = matches!(task.expected_hash, Some(ExpectedHash::Sha1(_)))
+            || self.hash_cache.is_some();
+        let mut sha1_hasher = need_sha1.then(Sha1::new);
+        let mut md5_hasher =
+            matches!(task.expected_hash, Some(ExpectedHash::Md5(_))).then(Md5::new);
 
         let mut stream = resp.bytes_stream();
 
         while let Some(chunk_res) = tokio::time::timeout(self.chunk_timeout, stream.next())
             .await
-            .map_err(|_| CoreError::DownloadFailed {
-                url: task.url.clone(),
-                status: None,
-                message: "Timed out reading response stream chunk".to_string(),
+            .map_err(|_| {
+                let part_cleanup = part_path.clone();
+                std::mem::drop(std::fs::remove_file(part_cleanup));
+                CoreError::DownloadFailed {
+                    url: task.url.clone(),
+                    status: None,
+                    message: "Timed out reading response stream chunk".to_string(),
+                }
             })?
         {
             let chunk = match chunk_res {
                 Ok(c) => c,
                 Err(e) => {
-                    drop(file);
+                    drop(writer);
                     let _ = fs::remove_file(&part_path).await;
                     return Err(CoreError::Http(e));
                 }
@@ -437,8 +501,8 @@ impl Downloader {
                 h.update(&chunk);
             }
 
-            if let Err(io_err) = file.write_all(&chunk).await {
-                drop(file);
+            if let Err(io_err) = writer.write_all(&chunk).await {
+                drop(writer);
                 let _ = fs::remove_file(&part_path).await;
                 return Err(CoreError::Io(io_err));
             }
@@ -470,20 +534,21 @@ impl Downloader {
             }
         }
 
-        // Flush & sync before closing handle (critical on Windows to avoid EBUSY on rename)
-        if let Err(e) = file.flush().await {
-            drop(file);
+        // Flush buffered writes and close file handle BEFORE atomic rename (no per-file fsync!)
+        if let Err(e) = writer.flush().await {
+            drop(writer);
             let _ = fs::remove_file(&part_path).await;
             return Err(CoreError::Io(e));
         }
-        let _ = file.sync_data().await;
-        drop(file);
+        drop(writer);
+
+        let computed_sha1 = sha1_hasher.map(|h| hex::encode(h.finalize()));
 
         // Verify cryptographic hash BEFORE atomic rename
         if let Some(ref expected) = task.expected_hash {
             match expected {
                 ExpectedHash::Sha1(exp_hex) => {
-                    let actual_hex = hex::encode(sha1_hasher.unwrap().finalize());
+                    let actual_hex = computed_sha1.clone().unwrap_or_default();
                     if !actual_hex.eq_ignore_ascii_case(exp_hex.trim()) {
                         let _ = fs::remove_file(&part_path).await;
                         return Err(CoreError::HashMismatch {
@@ -507,7 +572,7 @@ impl Downloader {
             }
         }
 
-        // On Windows, `rename` may fail if destination already exists and is read-only; remove if needed
+        clear_readonly_if_exists(&task.destination);
         #[cfg(windows)]
         if task.destination.exists() {
             let _ = fs::remove_file(&task.destination).await;
@@ -522,6 +587,10 @@ impl Downloader {
             ensure_executable(&task.destination)?;
         }
 
+        if let (Some(ref cache), Some(sha1_hex)) = (&self.hash_cache, computed_sha1) {
+            cache.record_path(&task.destination, sha1_hex);
+        }
+
         let cur_dl = downloaded_total.load(Ordering::Relaxed);
         let cur_tot = total_bytes.load(Ordering::Relaxed).max(cur_dl);
         on_event(LaunchEvent::Progress {
@@ -532,6 +601,58 @@ impl Downloader {
 
         Ok(())
     }
+}
+
+pub(crate) fn spawn_speed_reporter(
+    ticker_downloaded: Arc<AtomicU64>,
+    ticker_total: Arc<AtomicU64>,
+    ticker_cb: EventCallback,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        interval.tick().await;
+        let mut prev_bytes = 0u64;
+        let mut prev_instant = Instant::now();
+        let mut window: VecDeque<f64> = VecDeque::with_capacity(6);
+
+        loop {
+            interval.tick().await;
+            let now = Instant::now();
+            let dt = now.duration_since(prev_instant).as_secs_f64();
+            if dt <= 0.0 {
+                continue;
+            }
+            let cur_bytes = ticker_downloaded.load(Ordering::Relaxed);
+            let delta = cur_bytes.saturating_sub(prev_bytes) as f64;
+            prev_bytes = cur_bytes;
+            prev_instant = now;
+
+            if window.len() >= 5 {
+                window.pop_front();
+            }
+            window.push_back(delta / dt);
+
+            let avg_speed = window.iter().sum::<f64>() / (window.len() as f64);
+            let speed_u64 = avg_speed.round().max(0.0) as u64;
+            ticker_cb(LaunchEvent::Speed {
+                bytes_per_sec: speed_u64,
+            });
+
+            let tot = ticker_total.load(Ordering::Relaxed);
+            if avg_speed > 1.0 && tot > cur_bytes {
+                let eta = ((tot - cur_bytes) as f64) / avg_speed;
+                if eta.is_finite() {
+                    ticker_cb(LaunchEvent::Estimated {
+                        seconds_remaining: eta,
+                    });
+                }
+            } else if tot > 0 && cur_bytes >= tot {
+                ticker_cb(LaunchEvent::Estimated {
+                    seconds_remaining: 0.0,
+                });
+            }
+        }
+    })
 }
 
 /// Deduplicates [`DownloadTask`] entries by normalized destination path so two concurrent tasks

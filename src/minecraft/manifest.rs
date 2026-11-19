@@ -60,17 +60,47 @@ pub struct ResolvedMinecraftVersion {
 }
 
 /// Fetches Mojang's `version_manifest_v2.json` and the target version's JSON metadata,
-/// seamlessly falling back to cached local files under `<root>/versions/` when offline,
-/// and applying Linux ARM32/ARM64 LWJGL native overrides when LWJGL `< 3.3.3`.
+/// skipping `version_manifest_v2.json` HTTP calls completely on warm launches when an explicit
+/// `versions/<id>/<id>.json` is already cached locally, seamlessly falling back to cached local
+/// files under `<root>/versions/` when offline, and applying Linux ARM32/ARM64 LWJGL native
+/// overrides when LWJGL `< 3.3.3`.
 pub async fn resolve_vanilla_version(
     root_dir: &Path,
     requested_version: &str,
     http: &reqwest::Client,
 ) -> CoreResult<ResolvedMinecraftVersion> {
+    let trimmed_req = requested_version.trim();
+
+    // Zero-HTTP warm fast-path: if `requested_version` is an explicit version ID (not a dynamic
+    // `latest_*` shorthand) and `versions/<id>/<id>.json` already exists and parses validly on disk,
+    // skip fetching `version_manifest_v2.json` and `<id>.json` over the network!
+    if !is_version_shorthand(trimmed_req) && !is_unsafe_version_segment(trimmed_req) {
+        let cached_path = root_dir
+            .join("versions")
+            .join(trimmed_req)
+            .join(format!("{trimmed_req}.json"));
+        if cached_path.is_file() {
+            if let Ok(cached_text) = fs::read_to_string(&cached_path).await {
+                if let Ok(mut cached_json) = serde_json::from_str::<serde_json::Value>(&cached_text)
+                {
+                    if is_valid_cached_version_json(&cached_json) {
+                        if TargetOs::current() == TargetOs::Linux {
+                            apply_linux_arm_lwjgl_overrides(&mut cached_json, TargetArch::current())?;
+                        }
+                        return Ok(ResolvedMinecraftVersion {
+                            version_id: trimmed_req.to_string(),
+                            version_json: cached_json,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     let manifest_cache_path = root_dir.join("versions").join("version_manifest_v2.json");
     let manifest_opt = fetch_or_load_manifest(http, &manifest_cache_path).await;
 
-    let version_id = resolve_version_shorthand(requested_version.trim(), manifest_opt.as_ref())?;
+    let version_id = resolve_version_shorthand(trimmed_req, manifest_opt.as_ref())?;
     let local_version_json_path = root_dir
         .join("versions")
         .join(&version_id)
@@ -103,6 +133,28 @@ pub async fn resolve_vanilla_version(
         version_id,
         version_json,
     })
+}
+
+fn is_version_shorthand(requested: &str) -> bool {
+    matches!(
+        requested,
+        "" | "latest_release" | "r" | "lr" | "latest_snapshot" | "s" | "ls"
+    )
+}
+
+fn is_unsafe_version_segment(requested: &str) -> bool {
+    requested.contains('/')
+        || requested.contains('\\')
+        || requested == "."
+        || requested == ".."
+        || requested.contains('\0')
+}
+
+fn is_valid_cached_version_json(json: &serde_json::Value) -> bool {
+    json.is_object()
+        && (json.get("libraries").is_some()
+            || json.get("mainClass").is_some()
+            || json.get("downloads").is_some())
 }
 
 /// Applies embedded ARM32 (`aarch`) or ARM64 (`aarch64`) LWJGL overrides ONLY when:

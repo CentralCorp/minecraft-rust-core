@@ -685,3 +685,382 @@ async fn test_launcher_offline_prepare_token_redaction_and_process_spawn() {
     assert!(captured.contains("instances/faction-alpha"));
     assert!(!captured.contains("SUPER_SECRET_ACCESS_TOKEN_XYZ"));
 }
+
+#[tokio::test]
+async fn test_shared_http_client_with_client_skin_variant_and_html_502_resilience() {
+    use minecraft_rust_core::auth::mojang::YggdrasilClient;
+    use minecraft_rust_core::downloader::Downloader;
+    use minecraft_rust_core::shared_http_client;
+
+    // Verify `shared_http_client()` returns a reusable singleton client
+    let shared_a = shared_http_client();
+    let shared_b = shared_http_client();
+    let _ = Downloader::with_client(shared_a.clone(), 12, 3);
+    let _ = MicrosoftClient::with_client(None, shared_b).unwrap();
+
+    // Local no-proxy client for localhost mock server
+    let local_http = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+
+    let observed_variants = Arc::new(Mutex::new(Vec::<String>::new()));
+    let variants_ref = Arc::clone(&observed_variants);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let variants_ref = Arc::clone(&variants_ref);
+            tokio::spawn(async move {
+                let (method, path, body) = read_full_http_request(&mut socket).await;
+                let body_str = String::from_utf8_lossy(&body);
+
+                let resp = match (method.as_str(), path.as_str()) {
+                    ("POST", "/api/skin-api/skins/update") => {
+                        if body_str.contains("slim") {
+                            variants_ref.lock().unwrap().push("slim".to_string());
+                        } else if body_str.contains("classic") {
+                            variants_ref.lock().unwrap().push("classic".to_string());
+                        }
+                        http_json_response("200 OK", &serde_json::json!({ "status": "success" }))
+                    }
+                    _ => {
+                        let html = b"<html><head><title>502 Bad Gateway</title></head><body><h1>502 Bad Gateway</h1>nginx</body></html>";
+                        let hdr = format!(
+                            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            html.len()
+                        );
+                        let mut out = hdr.into_bytes();
+                        out.extend_from_slice(html);
+                        out
+                    }
+                };
+
+                let _ = socket.write_all(&resp).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+
+    // 1. Test `AzAuthClient::with_client` + `upload_skin_with_variant(..., slim = true / false)`
+    let az = AzAuthClient::with_client(&base, local_http.clone()).unwrap();
+    az.upload_skin_with_variant("tok_123", TINY_PNG, true)
+        .await
+        .unwrap();
+    az.upload_skin_with_variant("tok_123", TINY_PNG, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        *observed_variants.lock().unwrap(),
+        vec!["slim".to_string(), "classic".to_string()]
+    );
+
+    // 2. HTML 502 Bad Gateway MUST return `CoreError::Auth` with HTTP status code (not a JSON parse error!)
+    let az_err = az.login("user", "pass", None).await.unwrap_err();
+    match az_err {
+        CoreError::Auth { reason, message } => {
+            assert_eq!(reason, "http_502");
+            assert!(message.contains("502"));
+        }
+        other => panic!("Expected CoreError::Auth(http_502) from AzAuth, got {other:?}"),
+    }
+
+    let ms_endpoints = MicrosoftEndpoints {
+        oauth_authorize: format!("{base}/oauth20_authorize.srf"),
+        oauth_token: format!("{base}/oauth20_token.srf"),
+        xbl_authenticate: format!("{base}/user/authenticate"),
+        xsts_authorize: format!("{base}/xsts/authorize"),
+        mc_services_base: base.clone(),
+    };
+    let ms = MicrosoftClient::with_endpoints(None, ms_endpoints);
+    let ms_err = ms.authenticate_with_code("CODE").await.unwrap_err();
+    match ms_err {
+        CoreError::Auth { reason, message } => {
+            assert_eq!(reason, "http_502");
+            assert!(message.contains("502"));
+        }
+        other => panic!("Expected CoreError::Auth(http_502) from MicrosoftClient, got {other:?}"),
+    }
+
+    let ygg = YggdrasilClient::with_client(Some(&base), local_http);
+    let ygg_err = ygg.login("user@example.com", Some("pass")).await.unwrap_err();
+    match ygg_err {
+        CoreError::Auth { reason, message } => {
+            assert_eq!(reason, "http_502");
+            assert!(message.contains("502"));
+        }
+        other => panic!("Expected CoreError::Auth(http_502) from YggdrasilClient, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_dns_srv_wire_codec_pointer_compression_and_live_udp_srv_to_tcp_ping() {
+    use minecraft_rust_core::status::{build_dns_srv_query, parse_dns_srv_response};
+    use tokio::net::UdpSocket;
+
+    // 1. Build query and craft a response using RFC 1035 `0xC0` name compression + 2 SRV records
+    let tx_id = 0x42A7;
+    let query = build_dns_srv_query("_minecraft._tcp.play.centralcorp.test.", tx_id).unwrap();
+
+    let mut resp = Vec::new();
+    resp.extend_from_slice(&tx_id.to_be_bytes());
+    resp.extend_from_slice(&0x8180u16.to_be_bytes()); // QR=1, RD=1, RA=1, RCODE=0
+    resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+    resp.extend_from_slice(&2u16.to_be_bytes()); // ANCOUNT=2
+    resp.extend_from_slice(&0u16.to_be_bytes());
+    resp.extend_from_slice(&0u16.to_be_bytes());
+    // Copy Question section verbatim from `query[12..]`
+    // `_minecraft` (10+1=11) + `_tcp` (4+1=5) -> `play.centralcorp.test` starts at offset 12 + 16 = 28 (`0x001C`)!
+    resp.extend_from_slice(&query[12..]);
+
+    let push_srv_rr = |pkt: &mut Vec<u8>, prio: u16, weight: u16, port: u16, host_label: &[u8]| {
+        // Owner name compressed pointer to Question (`0xC00C`)
+        pkt.extend_from_slice(&[0xC0, 0x0C]);
+        pkt.extend_from_slice(&33u16.to_be_bytes()); // TYPE = SRV
+        pkt.extend_from_slice(&1u16.to_be_bytes()); // CLASS = IN
+        pkt.extend_from_slice(&60u32.to_be_bytes()); // TTL = 60
+        // Target = `<host_label>.play.centralcorp.test` via compression pointer `0xC01C`!
+        let rdata_len = (6 + 1 + host_label.len() + 2) as u16;
+        pkt.extend_from_slice(&rdata_len.to_be_bytes());
+        pkt.extend_from_slice(&prio.to_be_bytes());
+        pkt.extend_from_slice(&weight.to_be_bytes());
+        pkt.extend_from_slice(&port.to_be_bytes());
+        pkt.push(host_label.len() as u8);
+        pkt.extend_from_slice(host_label);
+        pkt.extend_from_slice(&[0xC0, 0x1C]);
+    };
+
+    // Record 1: priority 10, weight 5 -> should sort AFTER priority 5!
+    push_srv_rr(&mut resp, 10, 5, 25571, b"backup");
+    // Record 2: priority 5, weight 20 -> MUST win!
+    push_srv_rr(&mut resp, 5, 20, 25570, b"node1");
+
+    let parsed = parse_dns_srv_response(&resp, tx_id).unwrap();
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].target, "node1.play.centralcorp.test");
+    assert_eq!(parsed[0].port, 25570);
+    assert_eq!(parsed[1].target, "backup.play.centralcorp.test");
+    assert_eq!(parsed[1].port, 25571);
+
+    // 2. Malicious self-referential pointer loop (`0xC0 0x0C` in Question at offset 12) MUST error without hanging!
+    let mut loop_pkt = Vec::new();
+    loop_pkt.extend_from_slice(&tx_id.to_be_bytes());
+    loop_pkt.extend_from_slice(&0x8180u16.to_be_bytes());
+    loop_pkt.extend_from_slice(&1u16.to_be_bytes());
+    loop_pkt.extend_from_slice(&0u16.to_be_bytes());
+    loop_pkt.extend_from_slice(&0u16.to_be_bytes());
+    loop_pkt.extend_from_slice(&0u16.to_be_bytes());
+    loop_pkt.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x21, 0x00, 0x01]);
+    assert!(parse_dns_srv_response(&loop_pkt, tx_id).is_err());
+
+    // 3. End-to-end live UDP SRV -> TCP Minecraft Server List Ping!
+    let tcp_mc = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let real_mc_port = tcp_mc.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = tcp_mc.accept().await {
+            let mut req_buf = [0u8; 256];
+            let _ = sock.read(&mut req_buf).await;
+
+            let json = serde_json::json!({
+                "version": { "name": "Velocity 3.4.0", "protocol": 769 },
+                "players": { "max": 500, "online": 142 },
+                "description": "SRV Resolved Server"
+            })
+            .to_string();
+            let mut body = Vec::new();
+            encode_varint(0x00, &mut body);
+            encode_mc_string(&json, &mut body);
+            let framed = frame_mc_packet(&body);
+            let _ = sock.write_all(&framed).await;
+        }
+    });
+
+    let udp_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dns_addr = udp_dns.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let mut qbuf = [0u8; 512];
+        if let Ok((n, peer)) = udp_dns.recv_from(&mut qbuf).await {
+            if n >= 12 {
+                let mut reply = Vec::new();
+                reply.extend_from_slice(&qbuf[0..2]); // Echo TX ID
+                reply.extend_from_slice(&0x8180u16.to_be_bytes());
+                reply.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+                reply.extend_from_slice(&1u16.to_be_bytes()); // ANCOUNT=1
+                reply.extend_from_slice(&0u16.to_be_bytes());
+                reply.extend_from_slice(&0u16.to_be_bytes());
+                reply.extend_from_slice(&qbuf[12..n]); // Echo Question
+
+                // Answer: SRV -> target `127.0.0.1` on `real_mc_port`
+                reply.extend_from_slice(&[0xC0, 0x0C]);
+                reply.extend_from_slice(&33u16.to_be_bytes());
+                reply.extend_from_slice(&1u16.to_be_bytes());
+                reply.extend_from_slice(&60u32.to_be_bytes());
+                let target_wire = b"\x03127\x010\x010\x011\x00";
+                let rdlen = (6 + target_wire.len()) as u16;
+                reply.extend_from_slice(&rdlen.to_be_bytes());
+                reply.extend_from_slice(&0u16.to_be_bytes()); // priority
+                reply.extend_from_slice(&5u16.to_be_bytes()); // weight
+                reply.extend_from_slice(&real_mc_port.to_be_bytes());
+                reply.extend_from_slice(target_wire);
+
+                let _ = udp_dns.send_to(&reply, peer).await;
+            }
+        }
+    });
+
+    let status = ServerStatusClient::new("play.centralcorp.test", 25565)
+        .with_srv_nameserver(dns_addr)
+        .with_timeout(3_000)
+        .ping()
+        .await
+        .unwrap();
+
+    assert!(status.online);
+    assert_eq!(status.version, "Velocity 3.4.0");
+    assert_eq!(status.players_online, 142);
+    assert_eq!(status.motd, "SRV Resolved Server");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_spawn_prepared_with_on_spawn_lossy_utf8_logs_and_signal_exit_code() {
+    use std::os::unix::fs::PermissionsExt;
+    use minecraft_rust_core::launch::PreparedLaunch;
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    // 1. Script printing raw non-UTF-8 CP1252 byte `0xE9` (`é` in Latin-1) + valid second line
+    let cp1252_script = root.join("cp1252-java.sh");
+    let script_bytes =
+        b"#!/usr/bin/env bash\nprintf 'Chargement r\\xe9ussi!\\r\\n'\necho 'SECOND_LINE_OK'\nexit 0\n";
+    tokio::fs::write(&cp1252_script, script_bytes).await.unwrap();
+    let mut perms = std::fs::metadata(&cp1252_script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&cp1252_script, perms).unwrap();
+
+    let opts = LaunchOptions {
+        url: None,
+        authenticator: offline_login("Runner"),
+        timeout_ms: 2_000,
+        path: root.clone(),
+        version: "1.20.4".to_string(),
+        instance: None,
+        detached: false,
+        intel_enabled_mac: false,
+        concurrent_downloads: 4,
+        bypass_offline: false,
+        loader: LoaderOptions::default(),
+        mcp: None,
+        verify: false,
+        ignored: Vec::new(),
+        jvm_args: Vec::new(),
+        game_args: Vec::new(),
+        auto_connect: None,
+        java: JavaOptions::default(),
+        screen: ScreenOptions::default(),
+        memory: MemoryOptions::default(),
+    };
+
+    let launcher = Launcher::with_client(opts, minecraft_rust_core::shared_http_client());
+    let prepared = PreparedLaunch {
+        java_path: cp1252_script,
+        jvm_args: Vec::new(),
+        main_class: "Main".to_string(),
+        game_args: Vec::new(),
+        cwd: root.clone(),
+    };
+
+    let timeline = Arc::new(Mutex::new(Vec::<String>::new()));
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<i32>();
+    let done_tx_m = Arc::new(Mutex::new(Some(done_tx)));
+
+    let tl_cb = Arc::clone(&timeline);
+    let ln_cb = Arc::clone(&lines);
+    let tx_cb = Arc::clone(&done_tx_m);
+    let cb: EventCallback = Arc::new(move |ev| match ev {
+        LaunchEvent::Data { line } => {
+            if line.starts_with("[minecraft-rust-core] Launching:") {
+                tl_cb.lock().unwrap().push("launching_event".to_string());
+            }
+            ln_cb.lock().unwrap().push(line);
+        }
+        LaunchEvent::Close { exit_code } => {
+            tl_cb.lock().unwrap().push("close_event".to_string());
+            if let Some(tx) = tx_cb.lock().unwrap().take() {
+                let _ = tx.send(exit_code);
+            }
+        }
+        _ => {}
+    });
+
+    let tl_spawn = Arc::clone(&timeline);
+    let spawned_pid = launcher
+        .spawn_prepared_with_on_spawn(&prepared, cb, move |pid| {
+            assert!(pid > 0);
+            tl_spawn.lock().unwrap().push("on_spawn".to_string());
+        })
+        .await
+        .unwrap();
+    assert!(spawned_pid > 0);
+
+    let code = tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(code, 0);
+
+    // `on_spawn(pid)` MUST run synchronously BEFORE `Launching:` and BEFORE `Close`!
+    let recorded_tl = timeline.lock().unwrap().clone();
+    assert_eq!(recorded_tl[0], "on_spawn");
+    assert_eq!(recorded_tl[1], "launching_event");
+    assert_eq!(recorded_tl.last().map(String::as_str), Some("close_event"));
+
+    // Non-UTF-8 `0xE9` line + subsequent `SECOND_LINE_OK` must BOTH be captured without dropping stdout!
+    let captured_output = lines.lock().unwrap().join("\n");
+    assert!(captured_output.contains("Chargement r\u{fffd}ussi!"));
+    assert!(captured_output.contains("SECOND_LINE_OK"));
+
+    // 2. Child terminating via `SIGTERM` (15) MUST report `128 + 15 = 143` instead of `0`!
+    let sig_script = root.join("sigterm-java.sh");
+    tokio::fs::write(&sig_script, b"#!/usr/bin/env bash\nkill -TERM $$\nsleep 2\n")
+        .await
+        .unwrap();
+    let mut sig_perms = std::fs::metadata(&sig_script).unwrap().permissions();
+    sig_perms.set_mode(0o755);
+    std::fs::set_permissions(&sig_script, sig_perms).unwrap();
+
+    let sig_prepared = PreparedLaunch {
+        java_path: sig_script,
+        jvm_args: Vec::new(),
+        main_class: "Main".to_string(),
+        game_args: Vec::new(),
+        cwd: root,
+    };
+    let (sig_tx, sig_rx) = tokio::sync::oneshot::channel::<i32>();
+    let sig_tx_m = Arc::new(Mutex::new(Some(sig_tx)));
+    let sig_cb: EventCallback = Arc::new(move |ev| {
+        if let LaunchEvent::Close { exit_code } = ev {
+            if let Some(tx) = sig_tx_m.lock().unwrap().take() {
+                let _ = tx.send(exit_code);
+            }
+        }
+    });
+
+    launcher
+        .spawn_prepared_with_on_spawn(sig_prepared, sig_cb, |_| {})
+        .await
+        .unwrap();
+    let sig_exit = tokio::time::timeout(std::time::Duration::from_secs(5), sig_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sig_exit, 143, "SIGTERM (15) must report 128 + 15 = 143");
+}
+

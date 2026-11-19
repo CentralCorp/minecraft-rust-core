@@ -750,3 +750,322 @@ async fn test_folder_zip_packages_selective_delta_download_and_optional_mods() {
     );
 }
 
+#[tokio::test]
+async fn test_file_hash_cache_persistence_zero_read_hit_invalidation_and_asset_fast_path() {
+    use minecraft_rust_core::FileHashCache;
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let game_dir = root.join("instances").join("perf-test");
+    tokio::fs::create_dir_all(game_dir.join("mods")).await.unwrap();
+
+    let mod_path = game_dir.join("mods/sodium.jar");
+    let mod_v1 = b"SODIUM_MOD_V1_PAYLOAD";
+    let sha1_v1 = sha1_hex(mod_v1);
+    tokio::fs::write(&mod_path, mod_v1).await.unwrap();
+
+    // 1. Cold check_bundle hashes `sodium.jar` and persists `.file_hash_cache_v1.json`
+    let cache = FileHashCache::load(&root).await;
+    assert!(cache.is_empty());
+
+    let mgr = BundleManager::new(root.clone(), game_dir.clone(), false, &[])
+        .with_hash_cache(cache.clone());
+    let item_v1 = BundleItem::download(
+        mod_path.clone(),
+        "https://cdn.example.com/mods/sodium.jar",
+        Some(sha1_v1.clone()),
+        Some(mod_v1.len() as u64),
+        "mods",
+    );
+
+    let pending_cold = mgr
+        .check_bundle(std::slice::from_ref(&item_v1), &noop_event_callback())
+        .await
+        .unwrap();
+    assert!(pending_cold.is_empty());
+    cache.save().await.unwrap();
+    assert!(FileHashCache::cache_file_path(&root).is_file());
+
+    // 2. Reload persisted cache from disk and verify warm 0-read hit
+    let reloaded = FileHashCache::load(&root).await;
+    assert_eq!(
+        reloaded.get_if_fresh_path(&mod_path).as_deref(),
+        Some(sha1_v1.as_str())
+    );
+
+    // 3. Remote update changes `expected_sha1` while local file is untouched -> MUST queue download!
+    let item_remote_v2 = BundleItem::download(
+        mod_path.clone(),
+        "https://cdn.example.com/mods/sodium.jar",
+        Some(sha1_hex(b"SODIUM_MOD_V2_NEW_RELEASE")),
+        Some(mod_v1.len() as u64),
+        "mods",
+    );
+    let mgr_reloaded = BundleManager::new(root.clone(), game_dir.clone(), false, &[])
+        .with_hash_cache(reloaded.clone());
+    let pending_remote_update = mgr_reloaded
+        .check_bundle(&[item_remote_v2], &noop_event_callback())
+        .await
+        .unwrap();
+    assert_eq!(pending_remote_update.len(), 1);
+
+    // 4. Local file size/content changes on disk -> cached entry invalidated and re-hashed!
+    tokio::fs::write(&mod_path, b"CORRUPTED_LOCAL_MOD_DIFFERENT_SIZE")
+        .await
+        .unwrap();
+    assert!(reloaded.get_if_fresh_path(&mod_path).is_none());
+    let pending_corrupt = mgr_reloaded
+        .check_bundle(&[item_v1], &noop_event_callback())
+        .await
+        .unwrap();
+    assert_eq!(pending_corrupt.len(), 1);
+
+    // 5. Mojang content-addressed asset (`assets/objects/<xx>/<40-hex-sha1>`):
+    //    - `verify == false` + matching `size` -> 0 file opens (treated as valid)
+    //    - `verify == true` -> opens & hashes file, catching tampered bytes of identical length!
+    let real_asset_bytes = b"MOJANG_SOUND_OGG_BYTES_12345";
+    let asset_sha1 = sha1_hex(real_asset_bytes);
+    let asset_path = root
+        .join("assets/objects")
+        .join(&asset_sha1[..2])
+        .join(&asset_sha1);
+    tokio::fs::create_dir_all(asset_path.parent().unwrap())
+        .await
+        .unwrap();
+    // Write same-length tampered bytes!
+    let tampered_same_len = vec![b'X'; real_asset_bytes.len()];
+    tokio::fs::write(&asset_path, &tampered_same_len)
+        .await
+        .unwrap();
+
+    let asset_item = BundleItem::download(
+        asset_path.clone(),
+        "https://resources.download.minecraft.net/fake",
+        Some(asset_sha1),
+        Some(real_asset_bytes.len() as u64),
+        "Assets",
+    );
+
+    let fast_mgr = BundleManager::new(root.clone(), game_dir.clone(), false, &[])
+        .with_hash_cache(FileHashCache::in_memory());
+    assert!(
+        fast_mgr
+            .check_bundle(std::slice::from_ref(&asset_item), &noop_event_callback())
+            .await
+            .unwrap()
+            .is_empty(),
+        "verify=false content-addressed asset fast-path checks size only"
+    );
+
+    let strict_mgr = BundleManager::new(root.clone(), game_dir.clone(), true, &[])
+        .with_verify_mode(true)
+        .with_hash_cache(FileHashCache::in_memory());
+    assert_eq!(
+        strict_mgr
+            .check_bundle(&[asset_item], &noop_event_callback())
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "verify=true must hash content-addressed asset and catch tampered bytes"
+    );
+}
+
+#[tokio::test]
+async fn test_isolated_natives_stamp_warm_skip_and_cleaner_protection() {
+    use minecraft_rust_core::minecraft::libraries::extract_natives_to;
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let game_dir = root.join("instances").join("instance-one");
+    let natives_dir = game_dir.join("natives");
+
+    let native_jar = root.join("libraries/org/lwjgl/lwjgl-natives-linux.jar");
+    tokio::fs::create_dir_all(native_jar.parent().unwrap())
+        .await
+        .unwrap();
+    let zip_bytes = build_zip_bytes(&[
+        ("liblwjgl.so", b"FAKE_ELF_SHARED_OBJECT"),
+        ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\r\n"),
+    ]);
+    tokio::fs::write(&native_jar, &zip_bytes).await.unwrap();
+
+    let extract_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count_ref = Arc::clone(&extract_count);
+    let cb: EventCallback = Arc::new(move |ev| {
+        if matches!(ev, LaunchEvent::Extract { .. }) {
+            count_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+
+    // Cold extract -> writes `liblwjgl.so` + `.natives.json`, skips `META-INF`
+    extract_natives_to(&natives_dir, std::slice::from_ref(&native_jar), &cb)
+        .await
+        .unwrap();
+    assert_eq!(extract_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(natives_dir.join("liblwjgl.so").is_file());
+    assert!(natives_dir.join(".natives.json").is_file());
+    assert!(!natives_dir.join("META-INF").exists());
+
+    // Warm extract -> `.natives.json` stamp matches `(path, size, mtime)`, 0 re-extractions!
+    extract_natives_to(&natives_dir, std::slice::from_ref(&native_jar), &cb)
+        .await
+        .unwrap();
+    assert_eq!(
+        extract_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "Warm launch must skip re-extracting unchanged native libraries"
+    );
+
+    // `BundleManager::check_files` MUST protect `<game_dir>/natives`!
+    let manager = BundleManager::new(root, game_dir, true, &[]);
+    manager.check_files(&[]).await.unwrap();
+    assert!(
+        natives_dir.join("liblwjgl.so").is_file(),
+        "Isolated instance natives/ directory must never be deleted by check_files"
+    );
+}
+
+#[tokio::test]
+async fn test_per_package_fallback_preserves_succeeded_packages() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let game_dir = root.join("instances").join("per-pkg");
+
+    let good_payload = b"GOOD_MOD_FROM_ZIP_ONLY";
+    let broken_payload = b"RECOVERED_VIA_PER_FILE_FALLBACK";
+    let good_zip = build_zip_bytes(&[("mods/good.jar", good_payload)]);
+
+    let good_raw_hits = Arc::new(AtomicUsize::new(0));
+    let broken_raw_hits = Arc::new(AtomicUsize::new(0));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+
+    let g_hits = Arc::clone(&good_raw_hits);
+    let b_hits = Arc::clone(&broken_raw_hits);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let good_zip_clone = good_zip.clone();
+            let g_hits = Arc::clone(&g_hits);
+            let b_hits = Arc::clone(&b_hits);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+
+                let send_ok = |body: &[u8]| {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let mut v = head.into_bytes();
+                    v.extend_from_slice(body);
+                    v
+                };
+
+                let resp = match path {
+                    "/pkg/good.zip" => send_ok(&good_zip_clone),
+                    "/pkg/broken.zip" => {
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_vec()
+                    }
+                    "/raw/good.jar" => {
+                        g_hits.fetch_add(1, Ordering::SeqCst);
+                        send_ok(good_payload)
+                    }
+                    "/raw/broken.cfg" => {
+                        b_hits.fetch_add(1, Ordering::SeqCst);
+                        send_ok(broken_payload)
+                    }
+                    _ => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec(),
+                };
+                let _ = socket.write_all(&resp).await;
+            });
+        }
+    });
+
+    let downloader = Downloader::new(4, 3_000).with_no_proxy();
+    let manager = BundleManager::new(root, game_dir.clone(), true, &[]);
+
+    let packages = vec![
+        minecraft_rust_core::bundle::PackageDescriptor {
+            id: "good-p1".to_string(),
+            folder: "mods".to_string(),
+            url: format!("{base}/pkg/good.zip"),
+            sha1: None,
+            size: None,
+            files_count: Some(1),
+        },
+        minecraft_rust_core::bundle::PackageDescriptor {
+            id: "broken-p1".to_string(),
+            folder: "config".to_string(),
+            url: format!("{base}/pkg/broken.zip"),
+            sha1: None,
+            size: None,
+            files_count: Some(1),
+        },
+    ];
+
+    let items = vec![
+        BundleItem::download(
+            game_dir.join("mods/good.jar"),
+            format!("{base}/raw/good.jar"),
+            Some(sha1_hex(good_payload)),
+            Some(good_payload.len() as u64),
+            "mods",
+        )
+        .with_package_id("good-p1"),
+        BundleItem::download(
+            game_dir.join("config/broken.cfg"),
+            format!("{base}/raw/broken.cfg"),
+            Some(sha1_hex(broken_payload)),
+            Some(broken_payload.len() as u64),
+            "config",
+        )
+        .with_package_id("broken-p1"),
+    ];
+
+    manager
+        .sync_bundle(&downloader, &items, &packages, &noop_event_callback())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        good_raw_hits.load(Ordering::SeqCst),
+        0,
+        "Succeeded package must NOT fall back to per-file download when sibling package fails!"
+    );
+    assert_eq!(
+        broken_raw_hits.load(Ordering::SeqCst),
+        1,
+        "Failed package must fall back cleanly to per-file download"
+    );
+    assert_eq!(
+        tokio::fs::read(game_dir.join("mods/good.jar")).await.unwrap(),
+        good_payload
+    );
+    assert_eq!(
+        tokio::fs::read(game_dir.join("config/broken.cfg"))
+            .await
+            .unwrap(),
+        broken_payload
+    );
+}
+
+

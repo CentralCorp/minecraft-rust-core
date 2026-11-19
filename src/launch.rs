@@ -1,9 +1,10 @@
+use std::borrow::Borrow;
 use std::path::PathBuf;
 use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::process::Command;
 
 use crate::bundle::{BundleItem, BundleManager};
@@ -14,11 +15,13 @@ use crate::events::{EventCallback, LaunchEvent};
 use crate::java::resolve_java_runtime;
 use crate::loader::install_loader;
 use crate::minecraft::arguments::build_launch_arguments;
-use crate::minecraft::assets::{collect_vanilla_assets, copy_legacy_assets_if_needed};
-use crate::minecraft::libraries::{collect_vanilla_libraries, extract_natives};
+use crate::minecraft::assets::{collect_vanilla_assets_parsed, copy_legacy_assets_from_parsed};
+use crate::minecraft::libraries::{collect_vanilla_libraries, extract_natives_to};
 use crate::minecraft::manifest::resolve_vanilla_version;
+use crate::utils::hash_cache::FileHashCache;
 use crate::utils::os_rules::RuleContext;
 use crate::utils::zip_extract::ensure_executable;
+use crate::utils::{exit_status_code, read_lossy_line};
 
 /// Fully prepared JVM invocation specification returned by [`Launcher::prepare`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,12 +51,24 @@ impl PreparedLaunch {
 #[derive(Debug, Clone)]
 pub struct Launcher {
     options: LaunchOptions,
+    http: reqwest::Client,
 }
 
 impl Launcher {
-    /// Creates a new [`Launcher`] bound to `options`.
+    /// Creates a new [`Launcher`] bound to `options`, reusing [`crate::shared_http_client()`].
     pub fn new(options: LaunchOptions) -> Self {
-        Self { options }
+        Self::with_client(options, crate::shared_http_client())
+    }
+
+    /// Creates a new [`Launcher`] bound to `options` and a caller-provided [`reqwest::Client`].
+    pub fn with_client(options: LaunchOptions, http: reqwest::Client) -> Self {
+        Self { options, http }
+    }
+
+    /// Builder-style override for the [`reqwest::Client`] used during [`Self::prepare`].
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
+        self
     }
 
     /// Returns a reference to the underlying [`LaunchOptions`].
@@ -61,9 +76,14 @@ impl Launcher {
         &self.options
     }
 
+    /// Returns a reference to the [`reqwest::Client`] used by this [`Launcher`].
+    pub fn client(&self) -> &reqwest::Client {
+        &self.http
+    }
+
     /// Resolves Java, verifies/downloads Minecraft, assets, libraries, mod loader, and custom
-    /// instance bundle files, runs `check_files` if `verify: true`, extracts natives, and
-    /// assembles final JVM & game arguments.
+    /// instance bundle files, runs `check_files` if `verify: true`, extracts per-instance natives,
+    /// and assembles final JVM & game arguments.
     pub async fn prepare(&self, on_event: EventCallback) -> CoreResult<PreparedLaunch> {
         if self.options.path.as_os_str().is_empty() {
             return Err(CoreError::InvalidConfig(
@@ -72,71 +92,84 @@ impl Launcher {
         }
 
         let game_dir = self.options.game_dir();
-        fs::create_dir_all(&self.options.path).await?;
-        fs::create_dir_all(self.options.path.join("assets")).await?;
-        fs::create_dir_all(self.options.path.join("libraries")).await?;
-        fs::create_dir_all(self.options.path.join("versions")).await?;
-        fs::create_dir_all(self.options.path.join("runtime")).await?;
-        fs::create_dir_all(&game_dir).await?;
-
-        let downloader = Downloader::new(
-            self.options.clamped_concurrency(),
-            self.options.timeout_ms,
-        );
-        let bundle_manager = BundleManager::from_options(&self.options);
-
-        // 1. Resolve Vanilla version manifest (with automatic offline local cache fallback + ARM LWJGL fixes)
-        let resolved_mc = resolve_vanilla_version(
-            &self.options.path,
-            &self.options.version,
-            downloader.client(),
-        )
-        .await?;
-        let mc_version_id = resolved_mc.version_id;
-        let version_json = resolved_mc.version_json;
-
-        // 2. Resolve Java Runtime (custom path -> Mojang JRE manifest -> Azul Zulu API)
-        let resolved_java = resolve_java_runtime(
-            &self.options,
-            &version_json,
-            &downloader,
-            &on_event,
-        )
-        .await?;
-
-        // 3. Collect Vanilla libraries, client JAR, assets, and optional custom instance distribution
-        let rule_ctx = RuleContext::current(self.options.intel_enabled_mac);
-        let vanilla_libs = collect_vanilla_libraries(
-            &self.options.path,
-            &mc_version_id,
-            &version_json,
-            &rule_ctx,
+        tokio::try_join!(
+            fs::create_dir_all(self.options.path.join("assets")),
+            fs::create_dir_all(self.options.path.join("libraries")),
+            fs::create_dir_all(self.options.path.join("versions")),
+            fs::create_dir_all(self.options.path.join("runtime")),
+            fs::create_dir_all(&game_dir),
         )?;
 
-        let vanilla_assets = collect_vanilla_assets(
-            &self.options.path,
-            &version_json,
-            downloader.client(),
+        let hash_cache = FileHashCache::load(&self.options.path).await;
+        let downloader = Downloader::with_client(
+            self.http.clone(),
+            self.options.clamped_concurrency(),
+            3,
         )
-        .await?;
+        .with_chunk_timeout(self.options.timeout_ms.max(30_000))
+        .with_hash_cache(hash_cache.clone());
+        let bundle_manager =
+            BundleManager::from_options(&self.options).with_hash_cache(hash_cache.clone());
 
-        let custom_dist = bundle_manager
-            .fetch_custom_distribution_packaged(downloader.client(), self.options.url.as_deref())
+        // 1 & 2 & 3. Run Vanilla discovery (manifest -> concurrent Java + asset index + libraries)
+        //            in parallel with custom instance distribution fetch (`tokio::try_join!`)!
+        let vanilla_discovery = async {
+            let resolved_mc = resolve_vanilla_version(
+                &self.options.path,
+                &self.options.version,
+                downloader.client(),
+            )
             .await?;
+            let mc_version_id = resolved_mc.version_id;
+            let version_json = resolved_mc.version_json;
+
+            let rule_ctx = RuleContext::current(self.options.intel_enabled_mac);
+            let vanilla_libs = collect_vanilla_libraries(
+                &self.options.path,
+                &mc_version_id,
+                &version_json,
+                &rule_ctx,
+            )?;
+
+            let (resolved_java, collected_assets) = tokio::try_join!(
+                resolve_java_runtime(&self.options, &version_json, &downloader, &on_event),
+                collect_vanilla_assets_parsed(
+                    &self.options.path,
+                    &version_json,
+                    downloader.client()
+                ),
+            )?;
+
+            Ok::<_, CoreError>((
+                mc_version_id,
+                version_json,
+                vanilla_libs,
+                resolved_java,
+                collected_assets,
+            ))
+        };
+
+        let custom_discovery = bundle_manager
+            .fetch_custom_distribution_packaged(downloader.client(), self.options.url.as_deref());
+
+        let (
+            (mc_version_id, version_json, vanilla_libs, resolved_java, collected_assets),
+            custom_dist,
+        ) = tokio::try_join!(vanilla_discovery, custom_discovery)?;
 
         let mut all_bundle_items = Vec::with_capacity(
             resolved_java.bundle_files.len()
                 + vanilla_libs.bundle_items.len()
-                + vanilla_assets.len()
+                + collected_assets.items.len()
                 + custom_dist.items.len(),
         );
         all_bundle_items.extend(resolved_java.bundle_files);
         all_bundle_items.extend(vanilla_libs.bundle_items);
-        all_bundle_items.extend(vanilla_assets);
+        all_bundle_items.extend(collected_assets.items);
         all_bundle_items.extend(custom_dist.items.iter().cloned());
 
-        // 4. Verify local hashes & selectively download direct files + dirty folder ZIP packages
-        //    atomically before running loader processors
+        // 4. Verify local hashes via FileHashCache & selectively download direct files + dirty
+        //    folder ZIP packages atomically before running loader processors
         bundle_manager
             .sync_bundle(
                 &downloader,
@@ -166,16 +199,18 @@ impl Launcher {
             bundle_manager.check_files(&valid_instance_items).await?;
         }
 
-        // 6. Extract native libraries & populate legacy `<path>/resources` if needed
-        extract_natives(
+        // 6. Extract native libraries to isolated `<game_dir>/natives` (or `<root>/versions/<id>/natives`)
+        //    with `.natives.json` warm-launch stamp & populate legacy `<path>/resources` if needed
+        let natives_dir = self.options.natives_dir(&mc_version_id);
+        extract_natives_to(&natives_dir, &vanilla_libs.native_jars, &on_event).await?;
+
+        copy_legacy_assets_from_parsed(
             &self.options.path,
-            &mc_version_id,
-            &vanilla_libs.native_jars,
-            &on_event,
+            &game_dir,
+            &version_json,
+            collected_assets.parsed_index.as_ref(),
         )
         .await?;
-
-        copy_legacy_assets_if_needed(&self.options.path, &game_dir, &version_json).await?;
 
         // 7. Install & patch mod loader (`Forge`, `NeoForge`, `Fabric`, `LegacyFabric`, `Quilt`) if enabled
         let loader_profile = install_loader(
@@ -187,6 +222,8 @@ impl Launcher {
             &on_event,
         )
         .await?;
+
+        hash_cache.save().await?;
 
         // 8. Build final deduplicated classpath, JVM arguments, mainClass, and game arguments
         let built = build_launch_arguments(
@@ -221,16 +258,24 @@ impl Launcher {
         prepared: &PreparedLaunch,
         on_event: EventCallback,
     ) -> CoreResult<u32> {
-        let full_args = prepared.full_args();
+        self.spawn_prepared_with_on_spawn(prepared, on_event, |_| {})
+            .await
+    }
 
-        let redacted_cmd = format_redacted_command(
-            &prepared.java_path,
-            &full_args,
-            &self.options,
-        );
-        on_event(LaunchEvent::Data {
-            line: format!("[minecraft-rust-core] Launching: {redacted_cmd}"),
-        });
+    /// Spawns an already-[`PreparedLaunch`] Minecraft JVM process (accepting either an owned
+    /// [`PreparedLaunch`] or `&PreparedLaunch`), invoking `on_spawn(pid)` **immediately after
+    /// `cmd.spawn()` succeeds and BEFORE emitting `Launching:` or spawning the `child.wait()`
+    /// background task** so callers can register the PID atomically before any `Close` event can fire.
+    pub async fn spawn_prepared_with_on_spawn(
+        &self,
+        prepared: impl Borrow<PreparedLaunch>,
+        callback: EventCallback,
+        on_spawn: impl FnOnce(u32) + Send + 'static,
+    ) -> CoreResult<u32> {
+        let prepared = prepared.borrow();
+        let full_args = prepared.full_args();
+        let redacted_cmd =
+            format_redacted_command(&prepared.java_path, &full_args, &self.options);
 
         let mut cmd = Command::new(&prepared.java_path);
         cmd.args(&full_args)
@@ -269,25 +314,35 @@ impl Launcher {
             )
         })?;
 
+        // 1. Register PID with caller synchronously BEFORE background wait task can emit `Close`!
+        on_spawn(pid);
+
+        // 2. Emit redacted launch line AFTER `cmd.spawn()` has succeeded
+        callback(LaunchEvent::Data {
+            line: format!("[minecraft-rust-core] Launching: {redacted_cmd}"),
+        });
+
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
         tokio::spawn(async move {
-            let cb_out = on_event.clone();
+            let cb_out = callback.clone();
             let out_task = tokio::spawn(async move {
                 if let Some(out) = stdout {
-                    let mut reader = BufReader::new(out).lines();
-                    while let Ok(Some(line)) = reader.next_line().await {
+                    let mut reader = BufReader::new(out);
+                    let mut buf = Vec::with_capacity(1024);
+                    while let Ok(Some(line)) = read_lossy_line(&mut reader, &mut buf).await {
                         cb_out(LaunchEvent::Data { line });
                     }
                 }
             });
 
-            let cb_err = on_event.clone();
+            let cb_err = callback.clone();
             let err_task = tokio::spawn(async move {
                 if let Some(err) = stderr {
-                    let mut reader = BufReader::new(err).lines();
-                    while let Ok(Some(line)) = reader.next_line().await {
+                    let mut reader = BufReader::new(err);
+                    let mut buf = Vec::with_capacity(1024);
+                    while let Ok(Some(line)) = read_lossy_line(&mut reader, &mut buf).await {
                         cb_err(LaunchEvent::Data { line });
                     }
                 }
@@ -298,16 +353,16 @@ impl Launcher {
             let _ = err_task.await;
 
             let exit_code = match status_res {
-                Ok(status) => status.code().unwrap_or(0),
+                Ok(status) => exit_status_code(&status),
                 Err(err) => {
-                    on_event(LaunchEvent::Error {
+                    callback(LaunchEvent::Error {
                         message: format!("Error waiting on Minecraft process (PID {pid}): {err}"),
                     });
                     -1
                 }
             };
 
-            on_event(LaunchEvent::Close { exit_code });
+            callback(LaunchEvent::Close { exit_code });
         });
 
         Ok(pid)
@@ -320,12 +375,7 @@ pub fn format_redacted_command(
     full_args: &[String],
     options: &LaunchOptions,
 ) -> String {
-    let sensitive_flags = [
-        "--accessToken",
-        "--uuid",
-        "--xuid",
-        "--clientId",
-    ];
+    let sensitive_flags = ["--accessToken", "--uuid", "--xuid", "--clientId"];
 
     let mut secret_values: Vec<&str> = Vec::new();
     let access_tok = options.authenticator.access_token.trim();

@@ -1,19 +1,19 @@
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use crate::bundle::BundleItem;
-use crate::error::CoreResult;
+use crate::error::{CoreError, CoreResult};
 use crate::minecraft::manifest::is_legacy_assets;
-use crate::utils::hash::sha1_file;
+use crate::utils::hash::sha1_bytes;
 use crate::utils::zip_extract::sanitize_archive_entry_path;
 
 const RESOURCES_BASE_URL: &str = "https://resources.download.minecraft.net";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct AssetIndexFile {
+pub(crate) struct AssetIndexFile {
     #[serde(default)]
     pub objects: BTreeMap<String, AssetObject>,
     #[serde(default, rename = "virtual")]
@@ -23,9 +23,15 @@ struct AssetIndexFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct AssetObject {
+pub(crate) struct AssetObject {
     pub hash: String,
     pub size: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CollectedVanillaAssets {
+    pub items: Vec<BundleItem>,
+    pub parsed_index: Option<AssetIndexFile>,
 }
 
 /// Fetches or loads the Minecraft `assetIndex` JSON and returns deduplicated [`BundleItem`] entries
@@ -35,12 +41,24 @@ pub async fn collect_vanilla_assets(
     version_json: &serde_json::Value,
     http: &reqwest::Client,
 ) -> CoreResult<Vec<BundleItem>> {
+    Ok(collect_vanilla_assets_parsed(root_dir, version_json, http)
+        .await?
+        .items)
+}
+
+/// Internal helper that parses the `assetIndex` JSON once in memory and returns both the
+/// [`BundleItem`] list and the parsed [`AssetIndexFile`] for reuse by [`copy_legacy_assets_from_parsed`].
+pub(crate) async fn collect_vanilla_assets_parsed(
+    root_dir: &Path,
+    version_json: &serde_json::Value,
+    http: &reqwest::Client,
+) -> CoreResult<CollectedVanillaAssets> {
     let Some(asset_index) = version_json.get("assetIndex") else {
-        return Ok(Vec::new());
+        return Ok(CollectedVanillaAssets::default());
     };
 
     let Some(index_id) = asset_index.get("id").and_then(|i| i.as_str()) else {
-        return Ok(Vec::new());
+        return Ok(CollectedVanillaAssets::default());
     };
     let index_url = asset_index.get("url").and_then(|u| u.as_str());
     let expected_sha1 = asset_index.get("sha1").and_then(|s| s.as_str());
@@ -50,13 +68,8 @@ pub async fn collect_vanilla_assets(
         .join("indexes")
         .join(format!("{index_id}.json"));
 
-    let index_raw_text = load_or_fetch_asset_index(
-        http,
-        index_url,
-        expected_sha1,
-        &local_index_path,
-    )
-    .await?;
+    let index_raw_text =
+        load_or_fetch_asset_index(http, index_url, expected_sha1, &local_index_path).await?;
 
     let parsed: AssetIndexFile = serde_json::from_str(&index_raw_text)?;
     let mut items = Vec::with_capacity(parsed.objects.len() + 1);
@@ -87,7 +100,10 @@ pub async fn collect_vanilla_assets(
         ));
     }
 
-    Ok(items)
+    Ok(CollectedVanillaAssets {
+        items,
+        parsed_index: Some(parsed),
+    })
 }
 
 /// Copies hashed objects to `<root>/resources` (matching `${assets_root}` / `${game_assets}` passed
@@ -98,50 +114,73 @@ pub async fn copy_legacy_assets_if_needed(
     game_dir: &Path,
     version_json: &serde_json::Value,
 ) -> CoreResult<()> {
-    let assets_id = version_json
-        .get("assetIndex")
-        .and_then(|ai| ai.get("id"))
-        .and_then(|id| id.as_str())
-        .or_else(|| version_json.get("assets").and_then(|a| a.as_str()));
+    copy_legacy_assets_from_parsed(root_dir, game_dir, version_json, None).await
+}
 
-    let Some(index_id) = assets_id else {
-        return Ok(());
+/// Reuses an already-parsed [`AssetIndexFile`] in memory without re-reading or re-parsing
+/// `assets/indexes/<id>.json` from disk (loading from disk only if `parsed_opt` is `None`).
+pub(crate) async fn copy_legacy_assets_from_parsed(
+    root_dir: &Path,
+    game_dir: &Path,
+    version_json: &serde_json::Value,
+    parsed_opt: Option<&AssetIndexFile>,
+) -> CoreResult<()> {
+    let owned_parsed: Option<AssetIndexFile>;
+    let parsed: &AssetIndexFile = match parsed_opt {
+        Some(p) => p,
+        None => {
+            let assets_id = version_json
+                .get("assetIndex")
+                .and_then(|ai| ai.get("id"))
+                .and_then(|id| id.as_str())
+                .or_else(|| version_json.get("assets").and_then(|a| a.as_str()));
+            let Some(index_id) = assets_id else {
+                return Ok(());
+            };
+            let index_path = root_dir
+                .join("assets")
+                .join("indexes")
+                .join(format!("{index_id}.json"));
+            if !index_path.exists() {
+                return Ok(());
+            }
+            let index_text = fs::read_to_string(&index_path).await?;
+            owned_parsed = Some(serde_json::from_str(&index_text)?);
+            owned_parsed.as_ref().expect("just assigned")
+        }
     };
 
-    let index_path = root_dir
-        .join("assets")
-        .join("indexes")
-        .join(format!("{index_id}.json"));
-    if !index_path.exists() {
-        return Ok(());
-    }
-
-    let index_text = fs::read_to_string(&index_path).await?;
-    let parsed: AssetIndexFile = serde_json::from_str(&index_text)?;
-
-    let should_copy_legacy = is_legacy_assets(version_json) || parsed.is_virtual || parsed.map_to_resources;
+    let should_copy_legacy =
+        is_legacy_assets(version_json) || parsed.is_virtual || parsed.map_to_resources;
     if !should_copy_legacy {
         return Ok(());
     }
 
-    // Always populate `<root>/resources` to match `--assetsDir <root>/resources`
-    let shared_resources = root_dir.join("resources");
-    populate_resources_dir(root_dir, &shared_resources, &parsed).await?;
+    let root_buf = root_dir.to_path_buf();
+    let game_buf = game_dir.to_path_buf();
+    let index_clone = parsed.clone();
 
-    // If `map_to_resources: true` and `game_dir != root_dir`, also mirror into `<game_dir>/resources`
-    if parsed.map_to_resources && game_dir != root_dir {
-        let instance_resources = game_dir.join("resources");
-        populate_resources_dir(root_dir, &instance_resources, &parsed).await?;
-    }
+    tokio::task::spawn_blocking(move || -> CoreResult<()> {
+        let shared_resources = root_buf.join("resources");
+        populate_resources_dir_sync(&root_buf, &shared_resources, &index_clone)?;
 
-    Ok(())
+        if index_clone.map_to_resources && game_buf != root_buf {
+            let instance_resources = game_buf.join("resources");
+            populate_resources_dir_sync(&root_buf, &instance_resources, &index_clone)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| CoreError::Other(format!("Legacy asset copy task panicked: {e}")))?
 }
 
-async fn populate_resources_dir(
+fn populate_resources_dir_sync(
     root_dir: &Path,
     target_resources_dir: &Path,
     index: &AssetIndexFile,
 ) -> CoreResult<()> {
+    let mut created_dirs: HashSet<PathBuf> = HashSet::new();
+
     for (rel_asset_key, obj) in &index.objects {
         if obj.hash.len() < 2 {
             continue;
@@ -149,6 +188,11 @@ async fn populate_resources_dir(
         let Some(safe_rel) = sanitize_archive_entry_path(rel_asset_key) else {
             continue;
         };
+
+        let dst = target_resources_dir.join(&safe_rel);
+        if dst.exists() {
+            continue;
+        }
 
         let src = root_dir
             .join("assets")
@@ -159,15 +203,12 @@ async fn populate_resources_dir(
             continue;
         }
 
-        let dst = target_resources_dir.join(&safe_rel);
-        if dst.exists() {
-            continue;
-        }
-
         if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent).await?;
+            if !parent.as_os_str().is_empty() && created_dirs.insert(parent.to_path_buf()) {
+                std::fs::create_dir_all(parent)?;
+            }
         }
-        fs::copy(&src, &dst).await?;
+        std::fs::copy(&src, &dst)?;
     }
     Ok(())
 }
@@ -178,15 +219,17 @@ async fn load_or_fetch_asset_index(
     expected_sha1: Option<&str>,
     local_path: &Path,
 ) -> CoreResult<String> {
-    if local_path.exists() {
-        if let Some(exp) = expected_sha1 {
-            if let Ok(actual) = sha1_file(local_path).await {
-                if actual.eq_ignore_ascii_case(exp) {
-                    return Ok(fs::read_to_string(local_path).await?);
+    if local_path.is_file() {
+        if let Ok(bytes) = fs::read(local_path).await {
+            let hash_matches = match expected_sha1 {
+                Some(exp) => sha1_bytes(&bytes).eq_ignore_ascii_case(exp.trim()),
+                None => index_url.is_none(),
+            };
+            if hash_matches {
+                if let Ok(text) = String::from_utf8(bytes) {
+                    return Ok(text);
                 }
             }
-        } else if index_url.is_none() {
-            return Ok(fs::read_to_string(local_path).await?);
         }
     }
 
@@ -202,7 +245,7 @@ async fn load_or_fetch_asset_index(
             }
             Err(e) => return Err(e.into()),
             Ok(resp) => {
-                return Err(crate::error::CoreError::DownloadFailed {
+                return Err(CoreError::DownloadFailed {
                     url: url.to_string(),
                     status: Some(resp.status().as_u16()),
                     message: "Failed to download Minecraft assetIndex".to_string(),

@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 
+use sha1::{Digest, Sha1};
 use tempfile::TempDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -12,6 +13,7 @@ use minecraft_rust_core::config::{
     JavaOptions, LaunchOptions, LoaderOptions, LoaderType, MemoryOptions, ScreenOptions,
     ServerConnect,
 };
+use minecraft_rust_core::java::parse_java_major_version;
 use minecraft_rust_core::loader::neoforge::{
     neoforge_version_prefix, select_modern_neoforge_build, select_neoforge_1_20_1_build,
 };
@@ -19,9 +21,11 @@ use minecraft_rust_core::loader::patcher::{
     is_already_patched, resolve_processor_token, InstallDataEntry, PatchContext, ProcessorSpec,
 };
 use minecraft_rust_core::minecraft::arguments::{
-    build_launch_arguments, LoaderProfileData, RawArgumentsSection,
+    build_deduplicated_classpath, build_launch_arguments, normalize_custom_arg_tokens,
+    supports_quick_play, LoaderProfileData, RawArgumentsSection,
 };
 use minecraft_rust_core::utils::maven::MavenArtifact;
+use minecraft_rust_core::utils::os_rules::{RuleContext, TargetArch, TargetOs};
 use minecraft_rust_core::utils::zip_extract::{parse_manifest_main_class, read_jar_main_class};
 
 fn make_base_options(root: PathBuf) -> LaunchOptions {
@@ -378,6 +382,25 @@ fn test_patcher_token_resolution_installer_path_and_cache_check() {
     ));
     std::fs::write(&patched_jar_path, b"PATCHED_CLIENT_JAR").unwrap();
     std::fs::write(loader_dir.join(".patched.ok"), b"ok\n").unwrap();
+
+    // With mismatched `PATCHED_SHA`, `ProcessorSpec.outputs` SHA-1 verification MUST reject cache!
+    assert!(!is_already_patched(
+        std::slice::from_ref(&proc_spec),
+        &data_map,
+        &ctx
+    ));
+
+    // Once `PATCHED_SHA` matches the real SHA-1 of `PATCHED_CLIENT_JAR`, `is_already_patched` returns true!
+    let mut sha1_hasher = Sha1::new();
+    sha1_hasher.update(b"PATCHED_CLIENT_JAR");
+    let real_sha = hex::encode(sha1_hasher.finalize());
+    data_map.insert(
+        "PATCHED_SHA".to_string(),
+        InstallDataEntry {
+            client: format!("'{real_sha}'"),
+            server: String::new(),
+        },
+    );
     assert!(is_already_patched(&[proc_spec], &data_map, &ctx));
 }
 
@@ -388,6 +411,8 @@ fn test_neoforge_legacy_1_20_1_and_modern_version_selection() {
     assert_eq!(neoforge_version_prefix("1.21").as_deref(), Some("21.0."));
     assert_eq!(neoforge_version_prefix("1.21.1").as_deref(), Some("21.1."));
     assert_eq!(neoforge_version_prefix("1.21.4").as_deref(), Some("21.4."));
+    assert_eq!(neoforge_version_prefix("26.1").as_deref(), Some("26.1.0."));
+    assert_eq!(neoforge_version_prefix("26.1.2").as_deref(), Some("26.1.2."));
 
     // Legacy 1.20.1 (`net.neoforged:forge`)
     let legacy_list = vec![
@@ -418,3 +443,299 @@ fn test_neoforge_legacy_1_20_1_and_modern_version_selection() {
         "21.1.72"
     );
 }
+
+#[test]
+fn test_mc_1_20_quickplay_no_dangling_flag_snapshot_detection_and_ipv6() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    // Real Mojang 1.20.4 manifest structure with BOTH `has_quick_plays_support` and `is_quick_play_multiplayer`
+    let mc_1_20_4_json = serde_json::json!({
+        "id": "1.20.4",
+        "type": "release",
+        "assets": "12",
+        "mainClass": "net.minecraft.client.main.Main",
+        "arguments": {
+            "game": [
+                "--username", "${auth_player_name}",
+                {
+                    "rules": [{ "action": "allow", "features": { "has_quick_plays_support": true } }],
+                    "value": ["--quickPlayPath", "${quickPlayPath}"]
+                },
+                {
+                    "rules": [{ "action": "allow", "features": { "is_quick_play_multiplayer": true } }],
+                    "value": ["--quickPlayMultiplayer", "${quickPlayMultiplayer}"]
+                },
+                "--danglingFlag",
+                "${unknown_placeholder}"
+            ],
+            "jvm": ["-cp", "${classpath}"]
+        },
+        "libraries": []
+    });
+
+    // 1. Embedded `host:port` inside `host` with default `port: 25565` must NOT emit `host:port:25565`!
+    let mut opts = make_base_options(root.clone());
+    opts.auto_connect = Some(ServerConnect {
+        host: "play.centralcorp.fr:25577".to_string(),
+        port: 25565,
+    });
+    let built = build_launch_arguments(&opts, "1.20.4", &mc_1_20_4_json, None).unwrap();
+
+    assert!(
+        !built.game_args.iter().any(|a| a == "--quickPlayPath"),
+        "Must NOT emit dangling --quickPlayPath before --quickPlayMultiplayer"
+    );
+    assert!(
+        !built.game_args.iter().any(|a| a == "--danglingFlag"),
+        "Pair-aware placeholder stripper must drop preceding flag when ${{...}} is unreplaced"
+    );
+    let qp_idx = built
+        .game_args
+        .iter()
+        .position(|a| a == "--quickPlayMultiplayer")
+        .unwrap();
+    assert_eq!(built.game_args[qp_idx + 1], "play.centralcorp.fr:25577");
+
+    // 2. Raw IPv6 literal `::1` on 1.20+ must be bracketed `[::1]:25565`
+    opts.auto_connect = Some(ServerConnect {
+        host: "::1".to_string(),
+        port: 25565,
+    });
+    let built_v6 = build_launch_arguments(&opts, "1.20.4", &mc_1_20_4_json, None).unwrap();
+    let qp_v6_idx = built_v6
+        .game_args
+        .iter()
+        .position(|a| a == "--quickPlayMultiplayer")
+        .unwrap();
+    assert_eq!(built_v6.game_args[qp_v6_idx + 1], "[::1]:25565");
+
+    // 3. Pre-1.20 snapshot `"19w14b"` (MC 1.14 snapshot) MUST NOT be misclassified as `>= 1.20`!
+    let snap_19w14b_json = serde_json::json!({
+        "id": "19w14b",
+        "type": "snapshot",
+        "assets": "1.14",
+        "mainClass": "net.minecraft.client.main.Main",
+        "arguments": {
+            "game": ["--username", "${auth_player_name}"],
+            "jvm": ["-cp", "${classpath}"]
+        },
+        "libraries": []
+    });
+    assert!(!supports_quick_play("19w14b", &snap_19w14b_json));
+    assert!(!supports_quick_play("1.19.4", &snap_19w14b_json));
+    assert!(supports_quick_play("1.20-pre1", &snap_19w14b_json));
+    assert!(supports_quick_play("1.20-rc1", &snap_19w14b_json));
+    assert!(supports_quick_play("26.1", &snap_19w14b_json));
+
+    opts.version = "19w14b".to_string();
+    opts.auto_connect = Some(ServerConnect {
+        host: "play.centralcorp.fr:25570".to_string(),
+        port: 25565,
+    });
+    let built_snap = build_launch_arguments(&opts, "19w14b", &snap_19w14b_json, None).unwrap();
+    assert!(!built_snap.game_args.contains(&"--quickPlayMultiplayer".to_string()));
+    let srv_idx = built_snap.game_args.iter().position(|a| a == "--server").unwrap();
+    assert_eq!(built_snap.game_args[srv_idx + 1], "play.centralcorp.fr");
+    let port_idx = built_snap.game_args.iter().position(|a| a == "--port").unwrap();
+    assert_eq!(built_snap.game_args[port_idx + 1], "25570");
+}
+
+#[test]
+fn test_dual_artifact_and_natives_text2speech_and_non_jar_exclusions() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // Exact MC 1.12.2 - 1.16.5 `com.mojang:text2speech:1.11.3` structure declaring BOTH `artifact` AND `natives`!
+    let version_json = serde_json::json!({
+        "id": "1.16.5",
+        "mainClass": "net.minecraft.client.main.Main",
+        "libraries": [
+            {
+                "name": "com.mojang:text2speech:1.11.3",
+                "downloads": {
+                    "artifact": {
+                        "path": "com/mojang/text2speech/1.11.3/text2speech-1.11.3.jar",
+                        "url": "https://libraries.minecraft.net/com/mojang/text2speech/1.11.3/text2speech-1.11.3.jar"
+                    },
+                    "classifiers": {
+                        "natives-linux": {
+                            "path": "com/mojang/text2speech/1.11.3/text2speech-1.11.3-natives-linux.jar"
+                        },
+                        "natives-windows": {
+                            "path": "com/mojang/text2speech/1.11.3/text2speech-1.11.3-natives-windows.jar"
+                        },
+                        "natives-osx": {
+                            "path": "com/mojang/text2speech/1.11.3/text2speech-1.11.3-natives-osx.jar"
+                        }
+                    }
+                },
+                "natives": {
+                    "linux": "natives-linux",
+                    "windows": "natives-windows",
+                    "osx": "natives-osx"
+                }
+            }
+        ]
+    });
+
+    let loader_profile = LoaderProfileData {
+        libraries: vec![
+            serde_json::json!({ "name": "net.minecraftforge:forge:1.16.5-36.2.39:clientdata@lzma" }),
+            serde_json::json!({ "name": "de.oceanlabs.mcp:mcp_config:1.16.5-20210115:mappings@txt" }),
+            serde_json::json!({ "name": "de.oceanlabs.mcp:mcp_config:1.16.5-20210115@tsrg" }),
+            serde_json::json!({ "name": "org.example:meta:1.0.0@pom" }),
+        ],
+        ..Default::default()
+    };
+
+    for (os, expected_native_suffix) in [
+        (TargetOs::Linux, "text2speech-1.11.3-natives-linux.jar"),
+        (TargetOs::Windows, "text2speech-1.11.3-natives-windows.jar"),
+        (TargetOs::MacOs, "text2speech-1.11.3-natives-osx.jar"),
+    ] {
+        let ctx = RuleContext {
+            os,
+            arch: TargetArch::X86_64,
+            intel_enabled_mac: false,
+            features: HashMap::new(),
+        };
+        let cp = build_deduplicated_classpath(
+            root,
+            None,
+            "1.16.5",
+            &version_json,
+            Some(&loader_profile),
+            &ctx,
+        )
+        .unwrap();
+        let cp_strs: Vec<String> = cp
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        // Base `text2speech-1.11.3.jar` MUST NEVER be dropped on any OS (including macOS where `natives-osx` is often absent or extra)!
+        assert!(
+            cp_strs.iter().any(|p| p.ends_with("/text2speech-1.11.3.jar")),
+            "Missing base text2speech-1.11.3.jar on {os:?}: {cp_strs:?}"
+        );
+        assert!(
+            cp_strs.iter().any(|p| p.ends_with(expected_native_suffix)),
+            "Missing native classifier {expected_native_suffix} on {os:?}: {cp_strs:?}"
+        );
+        assert!(
+            !cp_strs.iter().any(|p| {
+                p.ends_with(".lzma")
+                    || p.ends_with(".txt")
+                    || p.ends_with(".tsrg")
+                    || p.ends_with(".pom")
+            }),
+            "Non-archive Forge data files must be excluded from -cp: {cp_strs:?}"
+        );
+    }
+}
+
+#[test]
+fn test_paired_flags_custom_arg_splitting_alt_gc_and_isolated_natives() {
+    let raw_custom = vec![
+        "--add-opens java.base/java.lang=ALL-UNNAMED".to_string(),
+        "--add-opens java.base/java.util=ALL-UNNAMED".to_string(),
+        "-p /opt/modules/a.jar:/opt/modules/b.jar".to_string(),
+        "-Dcustom.dir=/opt/my path with spaces".to_string(),
+    ];
+    let normalized = normalize_custom_arg_tokens(&raw_custom);
+    assert_eq!(
+        normalized,
+        vec![
+            "--add-opens",
+            "java.base/java.lang=ALL-UNNAMED",
+            "--add-opens",
+            "java.base/java.util=ALL-UNNAMED",
+            "-p",
+            "/opt/modules/a.jar:/opt/modules/b.jar",
+            "-Dcustom.dir=/opt/my path with spaces",
+        ]
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut opts = make_base_options(root.clone());
+    opts.instance = Some("modded-zgc".to_string());
+    opts.jvm_args = vec![
+        "--add-opens java.base/java.lang=ALL-UNNAMED".to_string(),
+        "--add-opens java.base/java.util=ALL-UNNAMED".to_string(),
+        "-XX:+UseZGC".to_string(),
+        "-Dcustom.dir=/opt/my path with spaces".to_string(),
+    ];
+    opts.game_args = vec!["--customFlag customVal".to_string()];
+
+    // Legacy 1.12.2 profile with two `--tweakClass` pairs
+    let legacy_1_12_json = serde_json::json!({
+        "id": "1.12.2",
+        "type": "release",
+        "assets": "1.12",
+        "mainClass": "net.minecraft.client.main.Main",
+        "minecraftArguments": "--username ${auth_player_name} --version ${version_name} --gameDir ${game_directory} --assetsDir ${assets_root}",
+        "libraries": []
+    });
+    let loader_1_12 = LoaderProfileData {
+        main_class: Some("net.minecraft.launchwrapper.Launch".to_string()),
+        minecraft_arguments: Some(
+            "--username ${auth_player_name} --tweakClass net.minecraftforge.fml.common.launcher.FMLTweaker --tweakClass org.spongepowered.asm.launch.MixinTweaker".to_string()
+        ),
+        ..Default::default()
+    };
+
+    let built = build_launch_arguments(&opts, "1.12.2", &legacy_1_12_json, Some(&loader_1_12)).unwrap();
+
+    // 1. Both `--add-opens` pairs MUST remain intact!
+    let add_opens_count = built
+        .jvm_args
+        .iter()
+        .filter(|a| a.as_str() == "--add-opens")
+        .count();
+    assert_eq!(add_opens_count, 2, "Repeated --add-opens must never be stripped: {:?}", built.jvm_args);
+
+    // 2. `-XX:+UseZGC` MUST suppress default `-XX:G1*` flags!
+    assert!(built.jvm_args.contains(&"-XX:+UseZGC".to_string()));
+    assert!(!built.jvm_args.iter().any(|a| a.starts_with("-XX:G1")));
+
+    // 3. `-Dkey=path with spaces` stays intact!
+    assert!(built
+        .jvm_args
+        .contains(&"-Dcustom.dir=/opt/my path with spaces".to_string()));
+
+    // 4. Isolated per-instance natives directory (`<root>/instances/modded-zgc/natives`)!
+    let expected_natives = root.join("instances").join("modded-zgc").join("natives");
+    assert_eq!(opts.natives_dir("1.12.2"), expected_natives);
+    assert!(built.jvm_args.contains(&format!(
+        "-Djava.library.path={}",
+        expected_natives.to_string_lossy()
+    )));
+
+    // 5. Both `--tweakClass` pairs AND split `--customFlag customVal` survive in `game_args`!
+    let tweak_count = built
+        .game_args
+        .iter()
+        .filter(|a| a.as_str() == "--tweakClass")
+        .count();
+    assert_eq!(tweak_count, 2, "Multiple --tweakClass flags must survive: {:?}", built.game_args);
+    let cf_idx = built
+        .game_args
+        .iter()
+        .position(|a| a == "--customFlag")
+        .unwrap();
+    assert_eq!(built.game_args[cf_idx + 1], "customVal");
+}
+
+#[test]
+fn test_java_major_version_parsing() {
+    assert_eq!(parse_java_major_version("8"), Some(8));
+    assert_eq!(parse_java_major_version("1.8"), Some(8));
+    assert_eq!(parse_java_major_version("1.8.0_402"), Some(8));
+    assert_eq!(parse_java_major_version("17.0.10"), Some(17));
+    assert_eq!(parse_java_major_version("21.0.3+9-LTS"), Some(21));
+    assert_eq!(parse_java_major_version("jdk-21.0.2"), Some(21));
+    assert_eq!(parse_java_major_version(""), None);
+}
+

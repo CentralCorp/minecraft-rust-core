@@ -2,9 +2,11 @@ use std::time::Duration;
 
 use md5::{Digest, Md5};
 use serde::Serialize;
+use url::Url;
 use uuid::Uuid;
 
-use crate::auth::{AccountMeta, AuthAccount};
+use crate::auth::azauth::is_loopback_host;
+use crate::auth::{parse_auth_json_or_http_error, AccountMeta, AuthAccount};
 use crate::error::{CoreError, CoreResult};
 
 /// Default Mojang Yggdrasil authentication server URL.
@@ -60,23 +62,38 @@ impl Default for YggdrasilClient {
 }
 
 impl YggdrasilClient {
-    /// Creates a new [`YggdrasilClient`] (defaults to `https://authserver.mojang.com`).
+    /// Creates a new [`YggdrasilClient`] (defaults to `https://authserver.mojang.com`), reusing
+    /// [`crate::shared_http_client()`] (with `.no_proxy()` bypass for local test servers).
     pub fn new(base_url: Option<&str>) -> Self {
-        let resolved = base_url
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(DEFAULT_MOJANG_AUTH_URL)
-            .trim_end_matches('/')
-            .to_string();
+        let resolved = resolve_yggdrasil_base(base_url);
+        let is_local = Url::parse(&resolved)
+            .ok()
+            .map(|u| is_loopback_host(u.host_str()))
+            .unwrap_or(false);
 
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .user_agent("minecraft-rust-core/5.0")
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let http = if is_local {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .read_timeout(Duration::from_secs(15))
+                .tcp_nodelay(true)
+                .user_agent(concat!("minecraft-rust-core/", env!("CARGO_PKG_VERSION")))
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| crate::shared_http_client())
+        } else {
+            crate::shared_http_client()
+        };
 
         Self {
             base_url: resolved,
+            http,
+        }
+    }
+
+    /// Creates a new [`YggdrasilClient`] with a caller-provided [`reqwest::Client`].
+    pub fn with_client(base_url: Option<&str>, http: reqwest::Client) -> Self {
+        Self {
+            base_url: resolve_yggdrasil_base(base_url),
             http,
         }
     }
@@ -121,19 +138,26 @@ impl YggdrasilClient {
             .await?;
 
         let status = resp.status();
-        let raw: serde_json::Value = resp.json().await?;
+        let body_text = resp.text().await.map_err(CoreError::Http)?;
+        let raw = parse_auth_json_or_http_error("Yggdrasil authentication", status, &body_text)?;
 
         if !status.is_success() || raw.get("error").is_some() {
             let reason = raw
                 .get("error")
                 .and_then(|v| v.as_str())
-                .unwrap_or("yggdrasil_error")
-                .to_string();
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("http_{}", status.as_u16()));
             let message = raw
                 .get("errorMessage")
                 .and_then(|v| v.as_str())
-                .unwrap_or("Yggdrasil authentication failed")
-                .to_string();
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!(
+                        "Yggdrasil authentication failed (HTTP {})",
+                        status.as_u16()
+                    )
+                });
             return Err(CoreError::Auth { reason, message });
         }
 
@@ -162,19 +186,23 @@ impl YggdrasilClient {
             .await?;
 
         let status = resp.status();
-        let raw: serde_json::Value = resp.json().await?;
+        let body_text = resp.text().await.map_err(CoreError::Http)?;
+        let raw = parse_auth_json_or_http_error("Yggdrasil refresh", status, &body_text)?;
 
         if !status.is_success() || raw.get("error").is_some() {
             let reason = raw
                 .get("error")
                 .and_then(|v| v.as_str())
-                .unwrap_or("yggdrasil_refresh_error")
-                .to_string();
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("http_{}", status.as_u16()));
             let message = raw
                 .get("errorMessage")
                 .and_then(|v| v.as_str())
-                .unwrap_or("Yggdrasil token refresh failed")
-                .to_string();
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!("Yggdrasil token refresh failed (HTTP {})", status.as_u16())
+                });
             return Err(CoreError::Auth { reason, message });
         }
 
@@ -228,6 +256,15 @@ impl YggdrasilClient {
         let body = resp.text().await.unwrap_or_default();
         Ok(body.trim().is_empty())
     }
+}
+
+fn resolve_yggdrasil_base(base_url: Option<&str>) -> String {
+    base_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_MOJANG_AUTH_URL)
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn parse_yggdrasil_account(raw: &serde_json::Value) -> CoreResult<AuthAccount> {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs as std_fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -14,10 +14,11 @@ use crate::downloader::{DownloadTask, Downloader, ExpectedHash};
 use crate::error::{CoreError, CoreResult};
 use crate::events::{EventCallback, LaunchEvent};
 use crate::loader::patcher::{
-    run_processors, InstallDataEntry, PatchContext, ProcessorSpec,
+    is_already_patched, run_processors, InstallDataEntry, PatchContext, ProcessorSpec,
 };
 use crate::minecraft::arguments::{LoaderProfileData, RawArgumentsSection};
 use crate::utils::hash::md5_file;
+use crate::utils::hash_cache::clear_readonly_if_exists;
 use crate::utils::maven::{compare_maven_versions, MavenArtifact, DEFAULT_MAVEN_MIRRORS};
 use crate::utils::os_rules::{evaluate_rules, MojangRule, RuleContext};
 use crate::utils::zip_extract::{
@@ -123,6 +124,178 @@ struct InstallerArtifact {
     size: Option<u64>,
 }
 
+pub(crate) fn is_pinned_loader_build(build: &str) -> bool {
+    let trimmed = build.trim();
+    !trimmed.is_empty()
+        && !trimmed.eq_ignore_ascii_case("latest")
+        && !trimmed.eq_ignore_ascii_case("recommended")
+}
+
+/// Zero-HTTP warm fast-path shared by Forge and NeoForge when `options.loader.build` is pinned:
+/// verifies `loader_profile.json`, `.patched.ok` + `ProcessorSpec.outputs` SHA-1 (when applicable),
+/// and all runtime loader libraries via [`BundleManager::check_bundle`] (`FileHashCache`).
+pub(crate) async fn try_load_warm_forge_or_neoforge_profile(
+    options: &LaunchOptions,
+    mc_version_id: &str,
+    loader_dir: &Path,
+    java_bin: &Path,
+    bundle_manager: &BundleManager,
+    on_event: &EventCallback,
+) -> Option<LoaderProfileData> {
+    if !is_pinned_loader_build(&options.loader.build) {
+        return None;
+    }
+
+    let cached_profile_path = loader_dir.join("loader_profile.json");
+    if !cached_profile_path.is_file() {
+        return None;
+    }
+
+    let raw_profile_str = fs::read_to_string(&cached_profile_path).await.ok()?;
+    let profile: LoaderProfileData = serde_json::from_str(&raw_profile_str).ok()?;
+
+    let libraries_dir = options.path.join("libraries");
+
+    if let Some(ref custom_jar) = profile.custom_jar_path {
+        if !custom_jar.is_file() {
+            return None;
+        }
+    } else {
+        let install_profile_path = loader_dir.join("install_profile.json");
+        if !install_profile_path.is_file() {
+            return None;
+        }
+        let install_bytes = fs::read(&install_profile_path).await.ok()?;
+        let raw_install: RawInstallerProfile = serde_json::from_slice(&install_bytes).ok()?;
+
+        if raw_install.processors.iter().any(|p| p.applies_to_client()) {
+            let installer_jar = find_cached_installer_jar(loader_dir)
+                .unwrap_or_else(|| loader_dir.join("installer.jar"));
+            let profile_art = raw_install
+                .path
+                .as_deref()
+                .and_then(|p| MavenArtifact::parse(p).ok());
+            let mc_jar = options
+                .path
+                .join("versions")
+                .join(mc_version_id)
+                .join(format!("{mc_version_id}.jar"));
+            let mc_json = options
+                .path
+                .join("versions")
+                .join(mc_version_id)
+                .join(format!("{mc_version_id}.json"));
+
+            let patch_ctx = PatchContext {
+                root_dir: &options.path,
+                libraries_dir: &libraries_dir,
+                loader_dir,
+                installer_jar: &installer_jar,
+                mc_jar: &mc_jar,
+                mc_json: &mc_json,
+                java_bin,
+                base_loader_artifact: profile_art.as_ref(),
+            };
+
+            if !is_already_patched(&raw_install.processors, &raw_install.data, &patch_ctx) {
+                return None;
+            }
+        }
+    }
+
+    let rule_ctx = RuleContext::current(options.intel_enabled_mac);
+    if !verify_cached_installer_libraries(
+        &profile.libraries,
+        &libraries_dir,
+        &rule_ctx,
+        bundle_manager,
+        on_event,
+    )
+    .await
+    {
+        return None;
+    }
+
+    Some(profile)
+}
+
+fn find_cached_installer_jar(loader_dir: &Path) -> Option<PathBuf> {
+    let installers_dir = loader_dir.join("installers");
+    let entries = std_fs::read_dir(&installers_dir).ok()?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+async fn verify_cached_installer_libraries(
+    raw_libs: &[serde_json::Value],
+    libraries_dir: &Path,
+    rule_ctx: &RuleContext,
+    bundle_manager: &BundleManager,
+    on_event: &EventCallback,
+) -> bool {
+    let mut bundle_items = Vec::new();
+
+    for val in raw_libs {
+        let Ok(entry) = serde_json::from_value::<InstallerLibraryEntry>(val.clone()) else {
+            continue;
+        };
+        if entry.clientreq == Some(false) {
+            continue;
+        }
+        if let Some(ref rules) = entry.rules {
+            if !evaluate_rules(rules, rule_ctx) {
+                continue;
+            }
+        }
+        let Some(ref raw_name) = entry.name else {
+            continue;
+        };
+        let Ok(maven_art) = MavenArtifact::parse(raw_name) else {
+            continue;
+        };
+
+        if let Some(artifact) = entry.downloads.as_ref().and_then(|d| d.artifact.as_ref()) {
+            let rel_path = artifact
+                .path
+                .clone()
+                .unwrap_or_else(|| maven_art.relative_path());
+            let dest = libraries_dir.join(&rel_path);
+            if !dest.is_file() {
+                return false;
+            }
+            let raw_url = artifact.url.as_deref().unwrap_or("").trim();
+            if !raw_url.is_empty() {
+                bundle_items.push(BundleItem::download(
+                    dest,
+                    raw_url.to_string(),
+                    artifact.sha1.clone(),
+                    artifact.size,
+                    "Libraries",
+                ));
+            }
+        } else {
+            let dest = libraries_dir.join(maven_art.relative_path());
+            if !dest.is_file() {
+                return false;
+            }
+        }
+    }
+
+    if bundle_items.is_empty() {
+        return true;
+    }
+
+    match bundle_manager.check_bundle(&bundle_items, on_event).await {
+        Ok(pending) => pending.is_empty(),
+        Err(_) => false,
+    }
+}
+
 /// Installs Minecraft Forge (`1.7.10` through `1.21+`) into the isolated loader directory,
 /// extracting bundled `maven/**` artifacts, downloading required Maven libraries, running
 /// `install_profile.json` processors via `java_bin`, and returning [`LoaderProfileData`].
@@ -137,6 +310,19 @@ pub async fn install_forge(
     let loader_dir = options.loader_dir(mc_version_id);
     fs::create_dir_all(&loader_dir).await?;
     let cached_profile_path = loader_dir.join("loader_profile.json");
+
+    if let Some(warm_profile) = try_load_warm_forge_or_neoforge_profile(
+        options,
+        mc_version_id,
+        &loader_dir,
+        java_bin,
+        bundle_manager,
+        on_event,
+    )
+    .await
+    {
+        return Ok(warm_profile);
+    }
 
     let resolved_full_version = match resolve_forge_full_version(
         downloader.client(),
@@ -155,11 +341,8 @@ pub async fn install_forge(
         }
     };
 
-    let (classifier, ext, expected_md5) = fetch_forge_artifact_choice(
-        downloader.client(),
-        &resolved_full_version,
-    )
-    .await;
+    let (classifier, ext, expected_md5) =
+        fetch_forge_artifact_choice(downloader.client(), &resolved_full_version).await;
 
     let installers_dir = loader_dir.join("installers");
     fs::create_dir_all(&installers_dir).await?;
@@ -216,11 +399,7 @@ pub async fn install_forge(
     )
     .await?;
 
-    fs::write(
-        &cached_profile_path,
-        serde_json::to_string_pretty(&profile)?,
-    )
-    .await?;
+    write_json_if_changed(&cached_profile_path, &serde_json::to_vec_pretty(&profile)?).await?;
 
     Ok(profile)
 }
@@ -338,7 +517,7 @@ async fn fetch_forge_artifact_choice(
     ("installer".to_string(), "jar".to_string(), None)
 }
 
-/// Shared installer archive processor used by both Forge (`1.7.10`–`1.21+`) and NeoForge (`1.20.1`–`1.21+`).
+/// Shared installer archive processor used by both Forge (`1.7.10`–`1.21+`) and NeoForge (`1.20.1`–`26.x+`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_forge_or_neoforge_installer(
     options: &LaunchOptions,
@@ -383,9 +562,10 @@ pub(crate) async fn process_forge_or_neoforge_installer(
     };
 
     let raw_profile: RawInstallerProfile = serde_json::from_slice(&profile_bytes)?;
-    fs::write(loader_dir.join("install_profile.json"), &profile_bytes).await?;
+    write_json_if_changed(&loader_dir.join("install_profile.json"), &profile_bytes).await?;
 
     // Extract ALL `maven/**` entries from the installer JAR into `<root>/libraries/` FIRST!
+    // (`extract_zip_prefix_to_dir` skips existing files with matching byte size and extracts via `.part` + rename)
     {
         let inst = installer_path.to_path_buf();
         let libs_out = libraries_dir.clone();
@@ -407,12 +587,8 @@ pub(crate) async fn process_forge_or_neoforge_installer(
             {
                 let art = MavenArtifact::parse(coord)?;
                 let dest = art.to_library_path(&libraries_dir);
-                if let Some(bytes) = read_zip_entry_bytes(installer_path, entry_file)? {
-                    if let Some(parent) = dest.parent() {
-                        fs::create_dir_all(parent).await?;
-                    }
-                    fs::write(&dest, bytes).await?;
-                }
+                extract_single_installer_entry_to_library(installer_path, entry_file, &dest)
+                    .await?;
             }
         }
 
@@ -439,18 +615,11 @@ pub(crate) async fn process_forge_or_neoforge_installer(
         });
     }
 
-    // Case 3: Modern Forge (`1.12.2.2851+` / `1.13` – `1.21+`) & NeoForge (`1.20.1` – `1.21+`)
+    // Case 3: Modern Forge (`1.12.2.2851+` / `1.13` – `1.21+`) & NeoForge (`1.20.1` – `26.x+`)
     if let (Some(ref coord), Some(ref file_entry)) = (&raw_profile.path, &raw_profile.file_path) {
         if let Ok(art) = MavenArtifact::parse(coord) {
             let dest = art.to_library_path(&libraries_dir);
-            if !dest.exists() {
-                if let Some(bytes) = read_zip_entry_bytes(installer_path, file_entry)? {
-                    if let Some(parent) = dest.parent() {
-                        fs::create_dir_all(parent).await?;
-                    }
-                    fs::write(&dest, bytes).await?;
-                }
-            }
+            extract_single_installer_entry_to_library(installer_path, file_entry, &dest).await?;
         }
     }
 
@@ -458,15 +627,22 @@ pub(crate) async fn process_forge_or_neoforge_installer(
         .json
         .as_deref()
         .unwrap_or("/version.json")
-        .trim_start_matches('/');
+        .trim_start_matches('/')
+        .to_string();
 
-    let embedded_version_bytes = read_zip_entry_bytes(installer_path, json_entry_name)?
-        .ok_or_else(|| {
-            CoreError::LoaderError(format!(
-                "Installer '{}' is missing embedded '{json_entry_name}'",
-                installer_path.display()
-            ))
-        })?;
+    let embedded_version_bytes = {
+        let inst = installer_path.to_path_buf();
+        let entry_name = json_entry_name.clone();
+        tokio::task::spawn_blocking(move || read_zip_entry_bytes(&inst, &entry_name))
+            .await
+            .map_err(|e| CoreError::LoaderError(format!("Embedded version read failed: {e}")))??
+    }
+    .ok_or_else(|| {
+        CoreError::LoaderError(format!(
+            "Installer '{}' is missing embedded '{json_entry_name}'",
+            installer_path.display()
+        ))
+    })?;
     let embedded_version: EmbeddedVersionJson = serde_json::from_slice(&embedded_version_bytes)?;
 
     // Combine both `embedded_version.libraries` (runtime libraries) and `raw_profile.libraries`
@@ -540,6 +716,69 @@ pub(crate) async fn process_forge_or_neoforge_installer(
         is_old_forge: is_old,
         custom_jar_path: None,
     })
+}
+
+/// Extracts `entry_file` from `installer_path` into shared `<root>/libraries/` via `.part` + atomic
+/// rename, skipping extraction if `dest` already exists with identical byte size (multi-instance safe!).
+async fn extract_single_installer_entry_to_library(
+    installer_path: &Path,
+    entry_file: &str,
+    dest: &Path,
+) -> CoreResult<()> {
+    let inst = installer_path.to_path_buf();
+    let entry_owned = entry_file.to_string();
+    let dest_owned = dest.to_path_buf();
+
+    tokio::task::spawn_blocking(move || -> CoreResult<()> {
+        let Some(bytes) = read_zip_entry_bytes(&inst, &entry_owned)? else {
+            return Ok(());
+        };
+        if let Ok(meta) = std_fs::metadata(&dest_owned) {
+            if meta.is_file() && meta.len() == bytes.len() as u64 {
+                return Ok(());
+            }
+        }
+        if let Some(parent) = dest_owned.parent() {
+            std_fs::create_dir_all(parent)?;
+        }
+        let file_name = dest_owned
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("artifact.jar");
+        let part_path = dest_owned.with_file_name(format!(
+            ".{file_name}.{}.part",
+            std::process::id()
+        ));
+        if let Err(err) = std_fs::write(&part_path, &bytes) {
+            let _ = std_fs::remove_file(&part_path);
+            return Err(CoreError::Io(err));
+        }
+        clear_readonly_if_exists(&dest_owned);
+        #[cfg(windows)]
+        if dest_owned.exists() {
+            let _ = std_fs::remove_file(&dest_owned);
+        }
+        if let Err(err) = std_fs::rename(&part_path, &dest_owned) {
+            let _ = std_fs::remove_file(&part_path);
+            return Err(CoreError::Io(err));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| CoreError::LoaderError(format!("Library extract worker panicked: {e}")))?
+}
+
+pub(crate) async fn write_json_if_changed(path: &Path, bytes: &[u8]) -> CoreResult<()> {
+    if let Ok(existing) = fs::read(path).await {
+        if existing == bytes {
+            return Ok(());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(path, bytes).await?;
+    Ok(())
 }
 
 fn filter_legacy_client_libraries(libs: &[serde_json::Value]) -> Vec<serde_json::Value> {
@@ -710,6 +949,7 @@ async fn build_legacy_jar_mod_overlay(
     let work_dir = loader_dir.join("jar_overlay_tmp");
     let mod_archive = mod_archive_path.to_path_buf();
     let out_jar_clone = out_jar.clone();
+    let full_ver = full_loader_version.to_string();
 
     tokio::task::spawn_blocking(move || -> CoreResult<()> {
         if work_dir.exists() {
@@ -720,9 +960,14 @@ async fn build_legacy_jar_mod_overlay(
         extract_zip_archive(&vanilla_jar, &work_dir, true)?;
         extract_zip_archive(&mod_archive, &work_dir, false)?;
 
-        // Repack `work_dir` into `out_jar_clone`
-        let jar_file = std_fs::File::create(&out_jar_clone)?;
-        let mut zip_writer = ZipWriter::new(jar_file);
+        // Repack `work_dir` into `out_jar_clone` via buffered `.part` + atomic rename
+        let part_jar = out_jar_clone.with_file_name(format!(
+            ".minecraft-{full_ver}.jar.{}.part",
+            std::process::id()
+        ));
+        let jar_file = std_fs::File::create(&part_jar)?;
+        let buffered_jar = BufWriter::with_capacity(64 * 1024, jar_file);
+        let mut zip_writer = ZipWriter::new(buffered_jar);
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
         let mut stack = vec![work_dir.clone()];
@@ -740,12 +985,17 @@ async fn build_legacy_jar_mod_overlay(
                 }
             }
         }
-        zip_writer.finish()?;
+        let mut finished_writer = zip_writer.finish()?;
+        finished_writer.flush()?;
+        drop(finished_writer);
 
         let _ = std_fs::remove_dir_all(&work_dir);
-        // Quick sanity check that output JAR opens cleanly
-        let verify_f = std_fs::File::open(&out_jar_clone)?;
+        // Quick sanity check that output JAR opens cleanly before rename
+        let verify_f = std_fs::File::open(&part_jar)?;
         let _ = ZipArchive::new(verify_f)?;
+
+        clear_readonly_if_exists(&out_jar_clone);
+        std_fs::rename(&part_jar, &out_jar_clone)?;
         Ok(())
     })
     .await

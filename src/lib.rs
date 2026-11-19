@@ -47,3 +47,22 @@ pub use error::{CoreError, CoreResult};
 pub use events::{noop_event_callback, EventCallback, LaunchEvent};
 pub use launch::{Launcher, PreparedLaunch};
 pub use status::{ServerStatusClient, ServerStatusResponse};
+pub use utils::hash_cache::FileHashCache;
+
+/// Returns a process-wide shared [`reqwest::Client`] pooling TLS sessions and HTTP keep-alive
+/// connections across authentication, manifest discovery, server metadata, and file downloads.
+pub fn shared_http_client() -> reqwest::Client {
+    static SHARED_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    SHARED_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(30))
+                .tcp_nodelay(true)
+                .pool_idle_timeout(std::time::Duration::from_secs(60))
+                .user_agent(concat!("minecraft-rust-core/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
+}

@@ -50,7 +50,7 @@ pub struct BuiltArguments {
 }
 
 /// Builds the complete `jvm_args` (including deduplicated `-cp`), `main_class`, and `game_args`
-/// for launching Vanilla or Modded Minecraft (1.7.10 through 1.21+).
+/// for launching Vanilla or Modded Minecraft (`1.7.10` through `1.21+` and `26.x+`).
 pub fn build_launch_arguments(
     options: &LaunchOptions,
     mc_version_id: &str,
@@ -68,10 +68,12 @@ pub fn build_launch_arguments(
 
     let quick_play_supported = supports_quick_play(mc_version_id, version_json);
     if let Some(ref ac) = options.auto_connect {
-        if !ac.host.trim().is_empty() && quick_play_supported {
-            rule_ctx = rule_ctx
-                .with_feature("has_quick_plays_support", true)
-                .with_feature("is_quick_play_multiplayer", true);
+        let (norm_host, _) = ac.normalized();
+        if !norm_host.is_empty() && quick_play_supported {
+            // Note: Do NOT enable `has_quick_plays_support` here — Mojang's manifest binds that
+            // feature to `["--quickPlayPath", "${quickPlayPath}"]` (log file telemetry), NOT
+            // `--quickPlayMultiplayer`!
+            rule_ctx = rule_ctx.with_feature("is_quick_play_multiplayer", true);
         }
     }
 
@@ -128,6 +130,65 @@ pub fn build_launch_arguments(
     })
 }
 
+#[derive(Clone)]
+struct SelectedLib {
+    order_idx: usize,
+    version: String,
+    from_loader: bool,
+    resolved_path: PathBuf,
+}
+
+fn is_non_classpath_extension(ext: &str) -> bool {
+    matches!(
+        ext.trim().trim_start_matches('.').to_ascii_lowercase().as_str(),
+        "txt" | "lzma" | "tsrg" | "pom"
+    )
+}
+
+fn is_non_classpath_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(is_non_classpath_extension)
+        .unwrap_or(false)
+}
+
+fn upsert_classpath_slot(
+    slot_map: &mut HashMap<String, SelectedLib>,
+    order_idx: usize,
+    from_loader: bool,
+    artifact: &MavenArtifact,
+    resolved_path: PathBuf,
+) {
+    if is_non_classpath_extension(&artifact.extension) || is_non_classpath_path(&resolved_path) {
+        return;
+    }
+
+    let dedup_key = artifact.dedup_key();
+    match slot_map.get_mut(&dedup_key) {
+        None => {
+            slot_map.insert(
+                dedup_key,
+                SelectedLib {
+                    order_idx,
+                    version: artifact.version.clone(),
+                    from_loader,
+                    resolved_path,
+                },
+            );
+        }
+        Some(existing) => {
+            let cmp = compare_maven_versions(&artifact.version, &existing.version);
+            if cmp == Ordering::Greater
+                || (cmp == Ordering::Equal && from_loader && !existing.from_loader)
+            {
+                existing.version = artifact.version.clone();
+                existing.from_loader = from_loader;
+                existing.resolved_path = resolved_path;
+            }
+        }
+    }
+}
+
 /// Deduplicates combined Loader + Vanilla libraries by `(group, artifact, classifier, extension)`,
 /// keeping the highest version via [`compare_maven_versions`] across ALL platforms and MC versions!
 pub fn build_deduplicated_classpath(
@@ -144,7 +205,8 @@ pub fn build_deduplicated_classpath(
         .cloned()
         .unwrap_or_default();
 
-    let mut combined: Vec<(serde_json::Value, bool)> = Vec::new();
+    let mut combined: Vec<(serde_json::Value, bool)> =
+        Vec::with_capacity(vanilla_libs.len() + loader_profile.map(|lp| lp.libraries.len()).unwrap_or(0));
     if let Some(lp) = loader_profile {
         for lib in &lp.libraries {
             combined.push((lib.clone(), true));
@@ -160,14 +222,6 @@ pub fn build_deduplicated_classpath(
         .collect();
     let arch_specific_families =
         collect_arch_specific_native_families(all_names.iter().map(String::as_str), rule_ctx.os);
-
-    #[derive(Clone)]
-    struct SelectedLib {
-        order_idx: usize,
-        version: String,
-        from_loader: bool,
-        resolved_path: PathBuf,
-    }
 
     let mut slot_map: HashMap<String, SelectedLib> = HashMap::new();
     let libraries_root = root_dir.join("libraries");
@@ -196,61 +250,73 @@ pub fn build_deduplicated_classpath(
             continue;
         }
 
-        // Handle legacy `lib.natives` map: if present, ensure this OS has a native entry
-        let mut artifact = match MavenArtifact::parse(coord) {
+        let artifact = match MavenArtifact::parse(coord) {
             Ok(a) => a,
             Err(_) => continue,
         };
 
-        if let Some(natives_obj) = lib_val.get("natives").and_then(|n| n.as_object()) {
-            let os_key = rule_ctx.os.mojang_name();
-            let tpl = natives_obj.get(os_key).or_else(|| match rule_ctx.os {
-                TargetOs::MacOs => natives_obj.get("macos"),
-                _ => None,
-            });
-            let Some(tpl_str) = tpl.and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let classifier = tpl_str.replace("${arch}", rule_ctx.effective_arch().bitness_str());
-            artifact = artifact.with_classifier(Some(&classifier));
+        if is_non_classpath_extension(&artifact.extension) {
+            continue;
         }
 
-        // Prefer explicit `downloads.artifact.path` when present (and no legacy `natives` override)
-        let explicit_rel = if lib_val.get("natives").is_none() {
-            lib_val
-                .get("downloads")
-                .and_then(|d| d.get("artifact"))
+        let downloads_obj = lib_val.get("downloads");
+        let artifact_dl = downloads_obj.and_then(|d| d.get("artifact"));
+        let natives_obj = lib_val.get("natives").and_then(|n| n.as_object());
+
+        // 1. Base artifact: ALWAYS include when `downloads.artifact` is present (even if `natives`
+        //    is ALSO present on the same library object, e.g. `com.mojang:text2speech` in 1.12.2–1.16.5!)
+        //    OR when `natives` is absent.
+        if natives_obj.is_none() || artifact_dl.is_some() {
+            let explicit_rel = artifact_dl
                 .and_then(|a| a.get("path"))
                 .and_then(|p| p.as_str())
-        } else {
-            None
-        };
+                .filter(|rel| !rel.trim().is_empty());
 
-        let resolved_path = match explicit_rel {
-            Some(rel) if !rel.trim().is_empty() => libraries_root.join(rel),
-            _ => artifact.to_library_path(&libraries_root),
-        };
+            let resolved_path = match explicit_rel {
+                Some(rel) => libraries_root.join(rel),
+                None => artifact.to_library_path(&libraries_root),
+            };
 
-        let dedup_key = artifact.dedup_key();
-        match slot_map.get_mut(&dedup_key) {
-            None => {
-                slot_map.insert(
-                    dedup_key,
-                    SelectedLib {
-                        order_idx: idx,
-                        version: artifact.version.clone(),
-                        from_loader: *from_loader,
-                        resolved_path,
-                    },
+            upsert_classpath_slot(
+                &mut slot_map,
+                idx * 2,
+                *from_loader,
+                &artifact,
+                resolved_path,
+            );
+        }
+
+        // 2. Legacy `natives` classifier JAR: independently add `artifact.with_classifier(...)`
+        //    if `natives` maps `rule_ctx.os` to a classifier!
+        if let Some(natives_map) = natives_obj {
+            let os_key = rule_ctx.os.mojang_name();
+            let tpl = natives_map.get(os_key).or_else(|| match rule_ctx.os {
+                TargetOs::MacOs => natives_map.get("macos"),
+                _ => None,
+            });
+            if let Some(tpl_str) = tpl.and_then(|v| v.as_str()) {
+                let classifier =
+                    tpl_str.replace("${arch}", rule_ctx.effective_arch().bitness_str());
+                let native_artifact = artifact.with_classifier(Some(&classifier));
+                let explicit_native_rel = downloads_obj
+                    .and_then(|d| d.get("classifiers"))
+                    .and_then(|c| c.get(&classifier))
+                    .and_then(|ci| ci.get("path"))
+                    .and_then(|p| p.as_str())
+                    .filter(|rel| !rel.trim().is_empty());
+
+                let native_path = match explicit_native_rel {
+                    Some(rel) => libraries_root.join(rel),
+                    None => native_artifact.to_library_path(&libraries_root),
+                };
+
+                upsert_classpath_slot(
+                    &mut slot_map,
+                    idx * 2 + 1,
+                    *from_loader,
+                    &native_artifact,
+                    native_path,
                 );
-            }
-            Some(existing) => {
-                let cmp = compare_maven_versions(&artifact.version, &existing.version);
-                if cmp == Ordering::Greater || (cmp == Ordering::Equal && *from_loader && !existing.from_loader) {
-                    existing.version = artifact.version.clone();
-                    existing.from_loader = *from_loader;
-                    existing.resolved_path = resolved_path;
-                }
             }
         }
     }
@@ -294,6 +360,76 @@ pub fn build_deduplicated_classpath(
     Ok(final_paths)
 }
 
+fn uses_alternative_gc(custom_jvm_tokens: &[String]) -> bool {
+    custom_jvm_tokens.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-XX:+UseZGC"
+                | "-XX:+UseShenandoahGC"
+                | "-XX:+UseParallelGC"
+                | "-XX:+UseConcMarkSweepGC"
+                | "-XX:+UseSerialGC"
+                | "-XX:-UseG1GC"
+        )
+    })
+}
+
+fn is_paired_jvm_flag(token: &str) -> bool {
+    matches!(
+        token,
+        "--add-opens"
+            | "--add-exports"
+            | "--add-modules"
+            | "--add-reads"
+            | "--patch-module"
+            | "--limit-modules"
+            | "--upgrade-module-path"
+            | "-p"
+            | "--module-path"
+            | "-cp"
+            | "-classpath"
+    )
+}
+
+fn contains_contiguous_pair(args: &[String], flag: &str, val: &str) -> bool {
+    args.windows(2).any(|w| w[0] == flag && w[1] == val)
+}
+
+/// Smart-normalizes custom `jvm_args` / `game_args` entries:
+/// if an entry starts with `--` (or `-p `) followed by whitespace, has NO `=` before the first
+/// whitespace, and contains NO quotes (`"` or `'`), splits it on the first whitespace into
+/// `[flag, rest]` so `--add-opens java.base/java.lang=ALL-UNNAMED` or `--width 1920` work even
+/// when entered on a single line, while keeping `-Dkey=path with spaces` intact!
+pub fn normalize_custom_arg_tokens(entries: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(entries.len());
+
+    for raw in entries {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if !trimmed.contains('"') && !trimmed.contains('\'') {
+            if let Some(ws_idx) = trimmed.find(char::is_whitespace) {
+                let head = &trimmed[..ws_idx];
+                let rest = trimmed[ws_idx..].trim();
+                if !rest.is_empty()
+                    && (head.starts_with("--") || head == "-p")
+                    && !head.contains('=')
+                {
+                    out.push(head.to_string());
+                    out.push(rest.to_string());
+                    continue;
+                }
+            }
+        }
+
+        out.push(trimmed.to_string());
+    }
+
+    out
+}
+
 fn build_jvm_arguments(
     options: &LaunchOptions,
     mc_version_id: &str,
@@ -303,29 +439,35 @@ fn build_jvm_arguments(
     rule_ctx: &RuleContext,
 ) -> Vec<String> {
     let natives_dir = options
-        .path
-        .join("versions")
-        .join(mc_version_id)
-        .join("natives")
+        .natives_dir(mc_version_id)
         .to_string_lossy()
         .to_string();
     let libraries_dir = options.path.join("libraries").to_string_lossy().to_string();
     let cp_sep = classpath_separator();
 
+    let custom_jvm_tokens = normalize_custom_arg_tokens(&options.jvm_args);
+    let alt_gc = uses_alternative_gc(&custom_jvm_tokens);
+
     let mut jvm_args = vec![
         format!("-Xms{}", options.memory.min),
         format!("-Xmx{}", options.memory.max),
         "-XX:+UnlockExperimentalVMOptions".to_string(),
-        "-XX:G1NewSizePercent=20".to_string(),
-        "-XX:G1ReservePercent=20".to_string(),
-        "-XX:MaxGCPauseMillis=50".to_string(),
-        "-XX:G1HeapRegionSize=32M".to_string(),
+    ];
+
+    if !alt_gc {
+        jvm_args.push("-XX:G1NewSizePercent=20".to_string());
+        jvm_args.push("-XX:G1ReservePercent=20".to_string());
+        jvm_args.push("-XX:MaxGCPauseMillis=50".to_string());
+        jvm_args.push("-XX:G1HeapRegionSize=32M".to_string());
+    }
+
+    jvm_args.extend([
         "-Dfml.ignoreInvalidMinecraftCertificates=true".to_string(),
         format!("-Djna.tmpdir={natives_dir}"),
         format!("-Dorg.lwjgl.system.SharedLibraryExtractPath={natives_dir}"),
         format!("-Dio.netty.native.workdir={natives_dir}"),
         format!("-Djava.library.path={natives_dir}"),
-    ];
+    ]);
 
     // OS-specific JVM flags
     match rule_ctx.os {
@@ -356,11 +498,20 @@ fn build_jvm_arguments(
         jvm_args.push("-Dminecraft.api.services.host=https://nope.invalid/".to_string());
     }
 
-    // Custom user/instance JVM args
-    for custom in &options.jvm_args {
-        let trimmed = custom.trim();
-        if !trimmed.is_empty() && !jvm_args.iter().any(|existing| existing == trimmed) {
-            jvm_args.push(trimmed.to_string());
+    // Custom user/instance JVM args (preserving paired flags like repeated `--add-opens A --add-opens B`)
+    let mut custom_iter = custom_jvm_tokens.into_iter().peekable();
+    while let Some(tok) = custom_iter.next() {
+        if is_paired_jvm_flag(&tok) {
+            if let Some(val) = custom_iter.next() {
+                if !contains_contiguous_pair(&jvm_args, &tok, &val) {
+                    jvm_args.push(tok);
+                    jvm_args.push(val);
+                }
+            } else {
+                jvm_args.push(tok);
+            }
+        } else if !jvm_args.iter().any(|existing| existing == &tok) {
+            jvm_args.push(tok);
         }
     }
 
@@ -382,7 +533,11 @@ fn build_jvm_arguments(
         .and_then(|a| a.get("jvm"))
         .and_then(|j| j.as_array())
     {
-        let evaluated = expand_argument_entries(vanilla_jvm, rule_ctx, &jvm_placeholders);
+        let evaluated = strip_unresolved_placeholders(expand_argument_entries(
+            vanilla_jvm,
+            rule_ctx,
+            &jvm_placeholders,
+        ));
         let mut iter = evaluated.into_iter().peekable();
         while let Some(arg) = iter.next() {
             if arg == "-cp" || arg == "-classpath" {
@@ -414,12 +569,53 @@ fn build_jvm_arguments(
     // Append Mod Loader JVM arguments (Forge 1.17+ / NeoForge 1.20.2+ `-p <module_path>`, `--add-opens`, etc.)
     if let Some(lp) = loader_profile {
         if let Some(ref args_sec) = lp.arguments {
-            let loader_jvm = expand_argument_entries(&args_sec.jvm, rule_ctx, &jvm_placeholders);
+            let loader_jvm = strip_unresolved_placeholders(expand_argument_entries(
+                &args_sec.jvm,
+                rule_ctx,
+                &jvm_placeholders,
+            ));
             jvm_args.extend(loader_jvm);
         }
     }
 
     jvm_args
+}
+
+fn is_repeatable_game_flag(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--tweakClass" | "--fml.mods" | "--fml.mavenRoots" | "--addMods"
+    )
+}
+
+fn merge_legacy_argument_string(target: &mut Vec<String>, extra_str: &str) {
+    let tokens: Vec<&str> = extra_str.split_whitespace().collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i];
+        if tok.starts_with('-')
+            && !tok.contains('=')
+            && i + 1 < tokens.len()
+            && !tokens[i + 1].starts_with('-')
+        {
+            let val = tokens[i + 1];
+            if is_repeatable_game_flag(tok) {
+                if !contains_contiguous_pair(target, tok, val) {
+                    target.push(tok.to_string());
+                    target.push(val.to_string());
+                }
+            } else if !target.iter().any(|existing| existing == tok) {
+                target.push(tok.to_string());
+                target.push(val.to_string());
+            }
+            i += 2;
+        } else {
+            if !target.iter().any(|existing| existing == tok) {
+                target.push(tok.to_string());
+            }
+            i += 1;
+        }
+    }
 }
 
 fn build_game_arguments(
@@ -433,16 +629,12 @@ fn build_game_arguments(
     let mut raw_args: Vec<String> = Vec::new();
 
     if let Some(legacy_str) = version_json.get("minecraftArguments").and_then(|m| m.as_str()) {
-        // Legacy MC 1.7.10 -> 1.12.2: if Legacy Forge provides a full `minecraftArguments` string
-        // (with `--tweakClass cpw.mods.fml.common.launcher.FMLTweaker`), use/merge cleanly
+        // Legacy MC 1.7.10 -> 1.12.2: if Legacy Forge/LiteLoader provides `minecraftArguments`
+        // (including multiple `--tweakClass` flags), preserve pairs cleanly!
         if let Some(loader_mc_args) = loader_profile.and_then(|lp| lp.minecraft_arguments.as_deref())
         {
             raw_args.extend(loader_mc_args.split_whitespace().map(str::to_string));
-            for token in legacy_str.split_whitespace() {
-                if !raw_args.iter().any(|existing| existing == token) {
-                    raw_args.push(token.to_string());
-                }
-            }
+            merge_legacy_argument_string(&mut raw_args, legacy_str);
         } else {
             raw_args.extend(legacy_str.split_whitespace().map(str::to_string));
         }
@@ -458,11 +650,7 @@ fn build_game_arguments(
     if let Some(lp) = loader_profile {
         if lp.minecraft_arguments.is_none() || version_json.get("minecraftArguments").is_none() {
             if let Some(ref loader_mc_str) = lp.minecraft_arguments {
-                for token in loader_mc_str.split_whitespace() {
-                    if !raw_args.iter().any(|existing| existing == token) {
-                        raw_args.push(token.to_string());
-                    }
-                }
+                merge_legacy_argument_string(&mut raw_args, loader_mc_str);
             }
         }
         if let Some(ref args_sec) = lp.arguments {
@@ -525,7 +713,7 @@ fn build_game_arguments(
     let quick_play_mp = options
         .auto_connect
         .as_ref()
-        .map(|ac| format!("{}:{}", ac.host.trim(), ac.port))
+        .map(|ac| ac.quick_play_address())
         .unwrap_or_default();
     let width_str = options.screen.width.unwrap_or(854).to_string();
     let height_str = options.screen.height.unwrap_or(480).to_string();
@@ -550,11 +738,11 @@ fn build_game_arguments(
         ("${quickPlayMultiplayer}", &quick_play_mp),
     ];
 
-    let mut resolved_args: Vec<String> = raw_args
+    let substituted: Vec<String> = raw_args
         .into_iter()
         .map(|arg| apply_placeholders(&arg, &replacements))
-        .filter(|arg| !arg.starts_with("${"))
         .collect();
+    let mut resolved_args = strip_unresolved_placeholders(substituted);
 
     // Inject `--width` / `--height` if configured and not already emitted via `has_custom_resolution` rule
     if let (Some(w), Some(h)) = (options.screen.width, options.screen.height) {
@@ -573,31 +761,56 @@ fn build_game_arguments(
 
     // Inject multiplayer auto-connect (`--quickPlayMultiplayer host:port` on 1.20+ or `--server` / `--port` on < 1.20)
     if let Some(ref ac) = options.auto_connect {
-        let host = ac.host.trim();
-        if !host.is_empty() {
+        let (norm_host, norm_port) = ac.normalized();
+        if !norm_host.is_empty() {
             if quick_play_supported {
                 if !resolved_args.iter().any(|a| a == "--quickPlayMultiplayer") {
                     resolved_args.push("--quickPlayMultiplayer".to_string());
-                    resolved_args.push(format!("{host}:{}", ac.port));
+                    resolved_args.push(ac.quick_play_address());
                 }
             } else if !resolved_args.iter().any(|a| a == "--server") {
                 resolved_args.push("--server".to_string());
-                resolved_args.push(host.to_string());
+                resolved_args.push(norm_host);
                 resolved_args.push("--port".to_string());
-                resolved_args.push(ac.port.to_string());
+                resolved_args.push(norm_port.to_string());
             }
         }
     }
 
-    // Append extra custom game arguments
-    for extra in &options.game_args {
-        let trimmed = extra.trim();
-        if !trimmed.is_empty() {
-            resolved_args.push(trimmed.to_string());
-        }
-    }
+    // Append extra custom game arguments (smart-splitting single-line `--flag value` entries)
+    resolved_args.extend(normalize_custom_arg_tokens(&options.game_args));
 
     resolved_args
+}
+
+fn contains_unresolved_placeholder(s: &str) -> bool {
+    let Some(start) = s.find("${") else {
+        return false;
+    };
+    s[start + 2..].contains('}')
+}
+
+/// Pair-aware pass removing unreplaced `${...}` tokens: if a value argument still contains an
+/// unreplaced `${...}` placeholder, drops both that token AND any immediately preceding standalone
+/// `-flag` / `--flag` token (preventing dangling flags like `--quickPlayPath` before `--quickPlayMultiplayer`).
+fn strip_unresolved_placeholders(tokens: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+
+    for tok in tokens {
+        if contains_unresolved_placeholder(&tok) {
+            if !tok.starts_with('-') {
+                if let Some(prev) = out.last() {
+                    if prev.starts_with('-') && !prev.contains('=') {
+                        out.pop();
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(tok);
+    }
+
+    out
 }
 
 fn expand_argument_entries(
@@ -646,6 +859,9 @@ fn expand_argument_entries(
 }
 
 fn apply_placeholders(input: &str, replacements: &[(&str, &str)]) -> String {
+    if !input.contains("${") {
+        return input.to_string();
+    }
     let mut result = input.to_string();
     for (key, val) in replacements {
         if result.contains(key) {
@@ -655,18 +871,80 @@ fn apply_placeholders(input: &str, replacements: &[(&str, &str)]) -> String {
     result
 }
 
-fn supports_quick_play(mc_version_id: &str, version_json: &serde_json::Value) -> bool {
+/// Determines whether a Minecraft version supports `1.20+` `--quickPlayMultiplayer`:
+/// 1. Checks `arguments.game` rules/values for `is_quick_play_multiplayer` first.
+/// 2. Falls back to version comparison ONLY when `mc_version_id` starts with `"1."`
+///    (`minor >= 20`, handling `"1.20-pre1"` / `"1.20-rc1"`) or year-based `>= 26.` releases
+///    (never misclassifying pre-1.20 snapshots like `"19w14b"`!).
+pub fn supports_quick_play(mc_version_id: &str, version_json: &serde_json::Value) -> bool {
     if let Some(game_arr) = version_json
         .get("arguments")
         .and_then(|a| a.get("game"))
         .and_then(|g| g.as_array())
     {
-        let raw_json = serde_json::to_string(game_arr).unwrap_or_default();
-        if raw_json.contains("is_quick_play_multiplayer") {
-            return true;
+        for entry in game_arr {
+            if let Some(obj) = entry.as_object() {
+                if let Some(rules) = obj.get("rules").and_then(|r| r.as_array()) {
+                    for rule in rules {
+                        if rule
+                            .get("features")
+                            .and_then(|f| f.get("is_quick_play_multiplayer"))
+                            .is_some()
+                        {
+                            return true;
+                        }
+                    }
+                }
+                if let Some(val) = obj.get("value") {
+                    match val {
+                        serde_json::Value::String(s)
+                            if s == "--quickPlayMultiplayer"
+                                || s.contains("quickPlayMultiplayer") =>
+                        {
+                            return true;
+                        }
+                        serde_json::Value::Array(arr)
+                            if arr.iter().any(|v| {
+                                v.as_str()
+                                    .map(|s| s.contains("quickPlayMultiplayer"))
+                                    .unwrap_or(false)
+                            }) =>
+                        {
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
+            } else if let Some(s) = entry.as_str() {
+                if s.contains("quickPlayMultiplayer") {
+                    return true;
+                }
+            }
         }
     }
-    compare_maven_versions(mc_version_id, "1.20") != Ordering::Less
+
+    if version_json.get("minecraftArguments").is_some() && version_json.get("arguments").is_none() {
+        return false;
+    }
+
+    let trimmed = mc_version_id.trim();
+    if let Some(rest) = trimmed.strip_prefix("1.") {
+        let minor_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(minor) = minor_digits.parse::<u32>() {
+            return minor >= 20;
+        }
+        return false;
+    }
+
+    if let Some((year_part, after_dot)) = trimmed.split_once('.') {
+        if !after_dot.is_empty() && year_part.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(year) = year_part.parse::<u32>() {
+                return year >= 26;
+            }
+        }
+    }
+
+    false
 }
 
 fn resolve_macos_dock_icon(root_dir: &Path, version_json: &serde_json::Value) -> Option<String> {
@@ -681,11 +959,11 @@ fn resolve_macos_dock_icon(root_dir: &Path, version_json: &serde_json::Value) ->
         .join(format!("{assets_id}.json"));
     let content = std::fs::read_to_string(index_path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let hash = json
-        .get("objects")?
-        .get("icons/minecraft.icns")?
-        .get("hash")?
-        .as_str()?;
+    let objects = json.get("objects")?;
+    let icon_obj = objects
+        .get("icons/minecraft.icns")
+        .or_else(|| objects.get("minecraft/icons/minecraft.icns"))?;
+    let hash = icon_obj.get("hash")?.as_str()?;
     if hash.len() < 2 {
         return None;
     }

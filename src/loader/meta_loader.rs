@@ -8,9 +8,11 @@ use crate::config::{LaunchOptions, LoaderType};
 use crate::downloader::Downloader;
 use crate::error::{CoreError, CoreResult};
 use crate::events::EventCallback;
+use crate::loader::forge::{is_pinned_loader_build, write_json_if_changed};
 use crate::minecraft::arguments::{LoaderProfileData, RawArgumentsSection};
 use crate::utils::maven::{MavenArtifact, DEFAULT_MAVEN_MIRRORS};
 use crate::utils::os_rules::{evaluate_rules, MojangRule, RuleContext};
+use crate::utils::percent_encode;
 
 const FABRIC_META_V2_URL: &str = "https://meta.fabricmc.net/v2/versions";
 const FABRIC_MAVEN_URL: &str = "https://maven.fabricmc.net";
@@ -93,8 +95,8 @@ struct MetaLibraryEntry {
 }
 
 /// Installs Fabric (Meta v2), LegacyFabric (Meta v2), or Quilt (Meta v3), caches the profile
-/// inside `<loader_dir>/loader_profile.json` for offline reuse, downloads all required Maven
-/// libraries into `<root>/libraries/`, and returns [`LoaderProfileData`].
+/// inside `<loader_dir>/loader_profile.json` for zero-HTTP pinned warm launches and offline reuse,
+/// downloads/verifies all required Maven libraries into `<root>/libraries/`, and returns [`LoaderProfileData`].
 pub async fn install_meta_loader(
     loader_type: LoaderType,
     options: &LaunchOptions,
@@ -108,30 +110,45 @@ pub async fn install_meta_loader(
     fs::create_dir_all(&loader_dir).await?;
     let cached_profile_path = loader_dir.join("loader_profile.json");
 
-    let profile_data = match fetch_remote_meta_profile(
-        downloader.client(),
-        endpoints,
-        mc_version_id,
-        &options.loader.build,
-    )
-    .await
-    {
-        Ok(profile) => {
-            fs::write(
-                &cached_profile_path,
-                serde_json::to_string_pretty(&profile)?,
-            )
-            .await?;
-            profile
-        }
-        Err(err) => {
-            if cached_profile_path.exists() {
-                let raw = fs::read_to_string(&cached_profile_path).await?;
-                serde_json::from_str(&raw)?
-            } else {
-                return Err(err);
+    // Zero-HTTP warm fast-path: when `options.loader.build` is pinned to an explicit version
+    // and `loader_profile.json` already exists locally, skip querying Meta API over HTTP!
+    let warm_cached_profile: Option<LoaderProfileData> =
+        if is_pinned_loader_build(&options.loader.build) && cached_profile_path.is_file() {
+            fs::read_to_string(&cached_profile_path)
+                .await
+                .ok()
+                .and_then(|raw| serde_json::from_str::<LoaderProfileData>(&raw).ok())
+        } else {
+            None
+        };
+
+    let profile_data = match warm_cached_profile {
+        Some(cached) => cached,
+        None => match fetch_remote_meta_profile(
+            downloader.client(),
+            endpoints,
+            mc_version_id,
+            &options.loader.build,
+        )
+        .await
+        {
+            Ok(profile) => {
+                write_json_if_changed(
+                    &cached_profile_path,
+                    &serde_json::to_vec_pretty(&profile)?,
+                )
+                .await?;
+                profile
             }
-        }
+            Err(err) => {
+                if cached_profile_path.exists() {
+                    let raw = fs::read_to_string(&cached_profile_path).await?;
+                    serde_json::from_str(&raw)?
+                } else {
+                    return Err(err);
+                }
+            }
+        },
     };
 
     let libraries_dir = options.path.join("libraries");
@@ -158,7 +175,7 @@ async fn fetch_remote_meta_profile(
     mc_version: &str,
     requested_build: &str,
 ) -> CoreResult<LoaderProfileData> {
-    let encoded_mc = urlencoding::encode(mc_version.trim());
+    let encoded_mc = percent_encode(mc_version.trim());
     let loader_version = resolve_meta_loader_version(
         http,
         endpoints,
@@ -168,7 +185,7 @@ async fn fetch_remote_meta_profile(
     )
     .await?;
 
-    let encoded_loader = urlencoding::encode(&loader_version);
+    let encoded_loader = percent_encode(&loader_version);
     let profile_url = format!(
         "{}/loader/{encoded_mc}/{encoded_loader}/profile/json",
         endpoints.meta_base
@@ -291,7 +308,7 @@ async fn download_meta_libraries(
             mirror_url
         } else {
             direct_url
-        };
+        } ;
 
         bundle_items.push(BundleItem::download(
             dest,

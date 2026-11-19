@@ -16,7 +16,7 @@ fn default_version() -> String {
 }
 
 fn default_concurrent_downloads() -> usize {
-    5
+    12
 }
 
 fn default_loader_build() -> String {
@@ -440,12 +440,110 @@ pub struct ScreenOptions {
 }
 
 /// Optional multiplayer server auto-connect endpoint on game startup.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ServerConnect {
-    #[serde(alias = "ip", alias = "server", alias = "address")]
     pub host: String,
-    #[serde(default = "default_mc_port")]
     pub port: u16,
+}
+
+impl ServerConnect {
+    /// Normalizes `host` and `port`:
+    /// - Splits an embedded `host:port` suffix when `host` is not a raw unbracketed IPv6 literal
+    ///   (e.g. `"play.example.com:25566"` with default `port: 25565` -> `("play.example.com", 25566)`).
+    /// - Unbrackets `"[::1]:25570"` -> `("::1", 25570)` and `"[::1]"` -> `("::1", port)`.
+    pub fn normalized(&self) -> (String, u16) {
+        normalize_host_and_port(&self.host, self.port)
+    }
+
+    /// Formats the endpoint for MC `1.20+` `--quickPlayMultiplayer` (`host:port`, or `[ipv6]:port`
+    /// when `host` is an IPv6 literal).
+    pub fn quick_play_address(&self) -> String {
+        let (host, port) = self.normalized();
+        if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ServerConnect {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawServerConnect {
+            #[serde(alias = "ip", alias = "server", alias = "address")]
+            host: String,
+            #[serde(default)]
+            port: Option<u16>,
+        }
+
+        let raw = RawServerConnect::deserialize(deserializer)?;
+        let (clean_host, embedded_port) = split_embedded_host_port(&raw.host);
+        let port = match (raw.port, embedded_port) {
+            (Some(explicit), Some(ep)) if explicit == default_mc_port() || explicit == 0 => ep,
+            (Some(explicit), _) if explicit > 0 => explicit,
+            (_, Some(ep)) => ep,
+            _ => default_mc_port(),
+        };
+
+        Ok(Self {
+            host: clean_host,
+            port,
+        })
+    }
+}
+
+fn split_embedded_host_port(raw_host: &str) -> (String, Option<u16>) {
+    let trimmed = raw_host.trim();
+    if trimmed.is_empty() {
+        return (String::new(), None);
+    }
+
+    // Bracketed IPv6 literal: `[::1]:25570` or `[::1]`
+    if let Some(after_open) = trimmed.strip_prefix('[') {
+        if let Some((ipv6_body, remainder)) = after_open.split_once(']') {
+            let clean_ipv6 = ipv6_body.trim().to_string();
+            let rem = remainder.trim();
+            if let Some(port_str) = rem.strip_prefix(':') {
+                if let Ok(p) = port_str.trim().parse::<u16>() {
+                    if p > 0 {
+                        return (clean_ipv6, Some(p));
+                    }
+                }
+            }
+            return (clean_ipv6, None);
+        }
+    }
+
+    // Single colon `hostname:port` or `127.0.0.1:25566` (multiple colons = raw IPv6 literal like `::1`)
+    let colon_count = trimmed.bytes().filter(|&b| b == b':').count();
+    if colon_count == 1 {
+        if let Some((h, p_str)) = trimmed.rsplit_once(':') {
+            let clean_h = h.trim();
+            if !clean_h.is_empty() {
+                if let Ok(p) = p_str.trim().parse::<u16>() {
+                    if p > 0 {
+                        return (clean_h.to_string(), Some(p));
+                    }
+                }
+            }
+        }
+    }
+
+    (trimmed.to_string(), None)
+}
+
+fn normalize_host_and_port(raw_host: &str, raw_port: u16) -> (String, u16) {
+    let (clean_host, embedded_port) = split_embedded_host_port(raw_host);
+    let port = match embedded_port {
+        Some(ep) if raw_port == default_mc_port() || raw_port == 0 => ep,
+        _ if raw_port == 0 => default_mc_port(),
+        _ => raw_port,
+    };
+    (clean_host, port)
 }
 
 /// Complete multi-instance launch configuration passed to [`crate::launch::Launcher`].
@@ -518,6 +616,21 @@ impl LaunchOptions {
         }
     }
 
+    /// Returns the isolated native shared library directory:
+    /// - `<game_dir>/natives` when `instance` is set (preventing `os error 32` / `SIGBUS` when
+    ///   running two instances simultaneously), or
+    /// - `<path>/versions/<resolved_mc_version>/natives` otherwise.
+    pub fn natives_dir(&self, resolved_mc_version: &str) -> PathBuf {
+        if self.instance_slug().is_some() {
+            self.game_dir().join("natives")
+        } else {
+            self.path
+                .join("versions")
+                .join(resolved_mc_version)
+                .join("natives")
+        }
+    }
+
     /// Returns the isolated loader working directory (`<path>/loader/<slug_or_build>`),
     /// ensuring two instances or loader builds never overwrite each other's configs.
     pub fn loader_dir(&self, resolved_mc_version: &str) -> PathBuf {
@@ -563,9 +676,9 @@ impl LaunchOptions {
         }
     }
 
-    /// Returns `concurrent_downloads` clamped to `[1, 32]`.
+    /// Returns `concurrent_downloads` clamped to `[1, 64]`.
     pub fn clamped_concurrency(&self) -> usize {
-        self.concurrent_downloads.clamp(1, 32)
+        self.concurrent_downloads.clamp(1, 64)
     }
 }
 

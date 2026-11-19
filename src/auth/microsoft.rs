@@ -7,8 +7,12 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
-use crate::auth::{AccountMeta, AuthAccount, MinecraftProfile, SkinVariant, XboxInfo};
+use crate::auth::{
+    parse_auth_json_or_http_error, summarize_non_json_body, AccountMeta, AuthAccount,
+    MinecraftProfile, SkinVariant, XboxInfo,
+};
 use crate::error::{CoreError, CoreResult};
+use crate::utils::percent_encode;
 
 /// Default official Microsoft Live client ID for Minecraft launchers.
 pub const DEFAULT_MS_CLIENT_ID: &str = "00000000402b5328";
@@ -50,26 +54,27 @@ pub struct MicrosoftClient {
 }
 
 impl MicrosoftClient {
-    /// Creates a [`MicrosoftClient`], falling back to [`DEFAULT_MS_CLIENT_ID`] when `client_id`
-    /// is `None` or blank.
+    /// Creates a [`MicrosoftClient`] reusing [`crate::shared_http_client()`], falling back to
+    /// [`DEFAULT_MS_CLIENT_ID`] when `client_id` is `None` or blank.
     pub fn new(client_id: Option<&str>) -> Self {
+        Self::with_client(client_id, crate::shared_http_client())
+            .expect("MicrosoftClient::with_client is infallible for valid default endpoints")
+    }
+
+    /// Creates a [`MicrosoftClient`] with a caller-provided [`reqwest::Client`], falling back to
+    /// [`DEFAULT_MS_CLIENT_ID`] when `client_id` is `None` or blank.
+    pub fn with_client(client_id: Option<&str>, http: reqwest::Client) -> CoreResult<Self> {
         let resolved_id = client_id
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(DEFAULT_MS_CLIENT_ID)
             .to_string();
 
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .user_agent("minecraft-rust-core/5.0")
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-
-        Self {
+        Ok(Self {
             client_id: resolved_id,
             http,
             endpoints: MicrosoftEndpoints::default(),
-        }
+        })
     }
 
     /// Creates a [`MicrosoftClient`] overriding endpoint URLs (automatically bypassing proxies for `127.0.0.1` / `localhost`).
@@ -80,15 +85,22 @@ impl MicrosoftClient {
             .unwrap_or(DEFAULT_MS_CLIENT_ID)
             .to_string();
 
-        let mut builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .user_agent("minecraft-rust-core/5.0");
-        if endpoints.oauth_token.contains("127.0.0.1")
+        let is_local = endpoints.oauth_token.contains("127.0.0.1")
             || endpoints.oauth_token.contains("localhost")
-        {
-            builder = builder.no_proxy();
-        }
-        let http = builder.build().unwrap_or_else(|_| reqwest::Client::new());
+            || endpoints.oauth_token.contains("[::1]");
+
+        let http = if is_local {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .read_timeout(Duration::from_secs(20))
+                .tcp_nodelay(true)
+                .user_agent(concat!("minecraft-rust-core/", env!("CARGO_PKG_VERSION")))
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| crate::shared_http_client())
+        } else {
+            crate::shared_http_client()
+        };
 
         Self {
             client_id: resolved_id,
@@ -104,8 +116,8 @@ impl MicrosoftClient {
 
     /// Builds the Microsoft Live OAuth2 authorization URL to open in a browser or WebviewWindow.
     pub fn authorization_url(&self) -> String {
-        let encoded_client_id = urlencoding::encode(&self.client_id);
-        let encoded_redirect = urlencoding::encode(MS_REDIRECT_URI);
+        let encoded_client_id = percent_encode(&self.client_id);
+        let encoded_redirect = percent_encode(MS_REDIRECT_URI);
         format!(
             "{}?client_id={}&response_type=code&redirect_uri={}&scope=XboxLive.signin%20offline_access&cobrandid={}&prompt=select_account",
             self.endpoints.oauth_authorize,
@@ -266,7 +278,20 @@ impl MicrosoftClient {
             .await?;
 
         let status = resp.status();
-        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        let body_text = resp.text().await.map_err(CoreError::Http)?;
+        let body = match serde_json::from_str::<serde_json::Value>(&body_text) {
+            Ok(v) => v,
+            Err(_) => {
+                let snippet = summarize_non_json_body(&body_text);
+                return Err(CoreError::Auth {
+                    reason: format!("http_{}", status.as_u16()),
+                    message: format!(
+                        "Minecraft profile endpoint returned HTTP {}: {snippet}",
+                        status.as_u16()
+                    ),
+                });
+            }
+        };
 
         if !status.is_success() || body.get("id").and_then(|v| v.as_str()).is_none() {
             let err_code = body
@@ -343,9 +368,13 @@ impl MicrosoftClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
+            let summary = summarize_non_json_body(&text);
             return Err(CoreError::Auth {
                 reason: "skin_upload_failed".to_string(),
-                message: format!("Minecraft Services skin upload failed ({status}): {text}"),
+                message: format!(
+                    "Minecraft Services skin upload failed (HTTP {}): {summary}",
+                    status.as_u16()
+                ),
             });
         }
 
@@ -389,9 +418,13 @@ impl MicrosoftClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
+            let summary = summarize_non_json_body(&text);
             return Err(CoreError::Auth {
                 reason: "cape_update_failed".to_string(),
-                message: format!("Minecraft Services cape update failed ({status}): {text}"),
+                message: format!(
+                    "Minecraft Services cape update failed (HTTP {}): {summary}",
+                    status.as_u16()
+                ),
             });
         }
 
@@ -408,23 +441,33 @@ impl MicrosoftClient {
             .await?;
 
         let status = resp.status();
-        let raw: serde_json::Value = resp.json().await?;
+        let body_text = resp.text().await.map_err(CoreError::Http)?;
+        let raw = parse_auth_json_or_http_error("Microsoft Live OAuth2", status, &body_text)?;
 
         if !status.is_success() || raw.get("error").is_some() {
             let reason = raw
                 .get("error")
                 .and_then(|v| v.as_str())
-                .unwrap_or("oauth2_error")
-                .to_string();
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("http_{}", status.as_u16()));
             let message = raw
                 .get("error_description")
                 .and_then(|v| v.as_str())
-                .unwrap_or("Microsoft Live OAuth2 token exchange failed")
-                .to_string();
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!(
+                        "Microsoft Live OAuth2 token exchange failed (HTTP {})",
+                        status.as_u16()
+                    )
+                });
             return Err(CoreError::Auth { reason, message });
         }
 
-        serde_json::from_value(raw).map_err(CoreError::Json)
+        serde_json::from_value(raw).map_err(|e| CoreError::Auth {
+            reason: "invalid_oauth_payload".to_string(),
+            message: format!("Malformed Microsoft OAuth2 token response: {e}"),
+        })
     }
 
     async fn complete_xbox_and_minecraft_chain(
@@ -493,17 +536,28 @@ impl MicrosoftClient {
             .await?;
 
         let mc_status = mc_login_resp.status();
-        let mc_raw: serde_json::Value = mc_login_resp.json().await?;
+        let mc_body_text = mc_login_resp.text().await.map_err(CoreError::Http)?;
+        let mc_raw =
+            parse_auth_json_or_http_error("Minecraft Services Xbox login", mc_status, &mc_body_text)?;
 
         if !mc_status.is_success() || mc_raw.get("access_token").is_none() {
             let err_msg = mc_raw
                 .get("errorMessage")
                 .or_else(|| mc_raw.get("error"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("Minecraft Services Xbox login failed")
-                .to_string();
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!(
+                        "Minecraft Services Xbox login failed (HTTP {})",
+                        mc_status.as_u16()
+                    )
+                });
             return Err(CoreError::Auth {
-                reason: "mc_login_failed".to_string(),
+                reason: if !mc_status.is_success() {
+                    format!("http_{}", mc_status.as_u16())
+                } else {
+                    "mc_login_failed".to_string()
+                },
                 message: err_msg,
             });
         }
@@ -525,7 +579,13 @@ impl MicrosoftClient {
         let profile = match self.get_profile(&mc_access_token).await {
             Ok(profile) => profile,
             Err(profile_err) => {
-                if !owns_in_store {
+                // Only map 404/profile_not_found to `no_minecraft_license` — preserve upstream 502/503 HTTP errors!
+                let is_not_found = matches!(
+                    &profile_err,
+                    CoreError::Auth { reason, .. }
+                        if reason == "profile_not_found" || reason == "NOT_FOUND" || reason == "http_404"
+                );
+                if !owns_in_store && is_not_found {
                     return Err(CoreError::Auth {
                         reason: "no_minecraft_license".to_string(),
                         message: "This Microsoft account does not own Minecraft: Java Edition (and has no active Xbox Game Pass profile).".to_string(),
@@ -583,13 +643,26 @@ impl MicrosoftClient {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
+            let summary = summarize_non_json_body(&text);
             return Err(CoreError::Auth {
-                reason: "xbl_auth_failed".to_string(),
-                message: format!("Xbox Live authentication failed ({status}): {text}"),
+                reason: format!("http_{}", status.as_u16()),
+                message: format!(
+                    "Xbox Live authentication failed (HTTP {}): {summary}",
+                    status.as_u16()
+                ),
             });
         }
 
-        serde_json::from_str(&text).map_err(CoreError::Json)
+        serde_json::from_str(&text).map_err(|_| {
+            let summary = summarize_non_json_body(&text);
+            CoreError::Auth {
+                reason: "xbl_invalid_response".to_string(),
+                message: format!(
+                    "Xbox Live authentication returned invalid JSON (HTTP {}): {summary}",
+                    status.as_u16()
+                ),
+            }
+        })
     }
 
     async fn authorize_xsts(
@@ -626,13 +699,26 @@ impl MicrosoftClient {
                     ));
                 }
             }
+            let summary = summarize_non_json_body(&text);
             return Err(CoreError::Auth {
-                reason: "xsts_auth_failed".to_string(),
-                message: format!("XSTS authorization failed ({status}): {text}"),
+                reason: format!("http_{}", status.as_u16()),
+                message: format!(
+                    "XSTS authorization failed (HTTP {}): {summary}",
+                    status.as_u16()
+                ),
             });
         }
 
-        serde_json::from_str(&text).map_err(CoreError::Json)
+        serde_json::from_str(&text).map_err(|_| {
+            let summary = summarize_non_json_body(&text);
+            CoreError::Auth {
+                reason: "xsts_invalid_response".to_string(),
+                message: format!(
+                    "XSTS authorization returned invalid JSON (HTTP {}): {summary}",
+                    status.as_u16()
+                ),
+            }
+        })
     }
 
     async fn check_mcstore_entitlements(&self, mc_access_token: &str) -> bool {
@@ -688,21 +774,11 @@ impl MicrosoftClient {
 /// Maps Xbox Live XSTS `XErr` numeric codes to explicit human-readable diagnostics.
 pub fn map_xsts_error(xerr: u64, server_message: Option<&str>) -> CoreError {
     let message = match xerr {
-        2148916227 => {
-            "This account has been banned from Xbox Live.".to_string()
-        }
-        2148916233 => {
-            "This Microsoft account does not have an Xbox Live profile yet. Please sign in once at https://www.xbox.com to create your Gamertag.".to_string()
-        }
-        2148916235 => {
-            "Xbox Live is unavailable or restricted in your country/region.".to_string()
-        }
-        2148916236 | 2148916237 => {
-            "This Microsoft account requires adult age verification on https://www.xbox.com before signing in.".to_string()
-        }
-        2148916238 => {
-            "This is a child/teen account (under 18) and must be added to a Microsoft Family group by an adult with multiplayer and third-party access enabled.".to_string()
-        }
+        2148916227 => "This account has been banned from Xbox Live.".to_string(),
+        2148916233 => "This Microsoft account does not have an Xbox Live profile yet. Please sign in once at https://www.xbox.com to create your Gamertag.".to_string(),
+        2148916235 => "Xbox Live is unavailable or restricted in your country/region.".to_string(),
+        2148916236 | 2148916237 => "This Microsoft account requires adult age verification on https://www.xbox.com before signing in.".to_string(),
+        2148916238 => "This is a child/teen account (under 18) and must be added to a Microsoft Family group by an adult with multiplayer and third-party access enabled.".to_string(),
         other => match server_message.filter(|s| !s.trim().is_empty()) {
             Some(msg) => format!("Xbox Live XSTS error {other}: {msg}"),
             None => format!("Xbox Live XSTS authorization failed with code {other}"),

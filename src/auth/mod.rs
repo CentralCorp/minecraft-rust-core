@@ -248,3 +248,72 @@ where
         _ => None,
     })
 }
+
+/// Parses an authentication response body as JSON, returning a clean [`crate::error::CoreError::Auth`]
+/// carrying the HTTP status code when an upstream proxy/WAF returns an HTML `502`/`503`/`403` page
+/// instead of a JSON payload.
+pub(crate) fn parse_auth_json_or_http_error(
+    service: &str,
+    status: reqwest::StatusCode,
+    body_text: &str,
+) -> crate::error::CoreResult<serde_json::Value> {
+    match serde_json::from_str::<serde_json::Value>(body_text) {
+        Ok(val) => Ok(val),
+        Err(_) => {
+            let snippet = summarize_non_json_body(body_text);
+            let message = if snippet.is_empty() {
+                format!(
+                    "{service} returned HTTP {} {}",
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or("Error")
+                )
+            } else {
+                format!("{service} returned HTTP {}: {snippet}", status.as_u16())
+            };
+            Err(crate::error::CoreError::Auth {
+                reason: format!("http_{}", status.as_u16()),
+                message,
+            })
+        }
+    }
+}
+
+pub(crate) fn summarize_non_json_body(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(t_start) = lower.find("<title>") {
+        let after = &trimmed[t_start + "<title>".len()..];
+        let after_lower = &lower[t_start + "<title>".len()..];
+        if let Some(t_end) = after_lower.find("</title>") {
+            let title = after[..t_end].split_whitespace().collect::<Vec<_>>().join(" ");
+            if !title.is_empty() {
+                return title;
+            }
+        }
+    }
+
+    let mut plain = String::with_capacity(trimmed.len().min(200));
+    let mut in_tag = false;
+    for ch in trimmed.chars() {
+        if ch == '<' {
+            in_tag = true;
+            plain.push(' ');
+        } else if ch == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            plain.push(ch);
+        }
+    }
+
+    let collapsed = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > 160 {
+        let truncated: String = collapsed.chars().take(160).collect();
+        format!("{truncated}...")
+    } else {
+        collapsed
+    }
+}

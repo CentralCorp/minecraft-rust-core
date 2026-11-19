@@ -8,7 +8,10 @@ use crate::config::LaunchOptions;
 use crate::downloader::{DownloadTask, Downloader, ExpectedHash};
 use crate::error::{CoreError, CoreResult};
 use crate::events::EventCallback;
-use crate::loader::forge::process_forge_or_neoforge_installer;
+use crate::loader::forge::{
+    process_forge_or_neoforge_installer, try_load_warm_forge_or_neoforge_profile,
+    write_json_if_changed,
+};
 use crate::minecraft::arguments::LoaderProfileData;
 use crate::utils::hash::sha1_file;
 use crate::utils::maven::{compare_maven_versions, MavenArtifact};
@@ -32,8 +35,9 @@ struct NeoForgeVersionsResponse {
     versions: Vec<String>,
 }
 
-/// Installs NeoForge for both Legacy `1.20.1` (`net.neoforged:forge`) and Modern `1.20.2` – `1.21+`
-/// (`net.neoforged:neoforge`), running all installer processors and returning [`LoaderProfileData`].
+/// Installs NeoForge for Legacy `1.20.1` (`net.neoforged:forge`), Modern `1.20.2` – `1.21+`, and
+/// year-based `26.x+` releases (`net.neoforged:neoforge`), running all installer processors and
+/// returning [`LoaderProfileData`].
 pub async fn install_neoforge(
     options: &LaunchOptions,
     mc_version_id: &str,
@@ -45,6 +49,19 @@ pub async fn install_neoforge(
     let loader_dir = options.loader_dir(mc_version_id);
     fs::create_dir_all(&loader_dir).await?;
     let cached_profile_path = loader_dir.join("loader_profile.json");
+
+    if let Some(warm_profile) = try_load_warm_forge_or_neoforge_profile(
+        options,
+        mc_version_id,
+        &loader_dir,
+        java_bin,
+        bundle_manager,
+        on_event,
+    )
+    .await
+    {
+        return Ok(warm_profile);
+    }
 
     let is_legacy_1_20_1 = mc_version_id.trim() == "1.20.1";
     let artifact_name = if is_legacy_1_20_1 {
@@ -78,7 +95,8 @@ pub async fn install_neoforge(
         "{NEOFORGE_MAVEN_RELEASES_URL}/net/neoforged/{artifact_name}/{resolved_version}/{installer_filename}"
     );
 
-    let remote_sha1 = fetch_optional_sha1(downloader.client(), &format!("{installer_url}.sha1")).await;
+    let remote_sha1 =
+        fetch_optional_sha1(downloader.client(), &format!("{installer_url}.sha1")).await;
 
     let needs_download = if !installer_path.exists() {
         true
@@ -119,21 +137,18 @@ pub async fn install_neoforge(
     )
     .await?;
 
-    fs::write(
-        &cached_profile_path,
-        serde_json::to_string_pretty(&profile)?,
-    )
-    .await?;
+    write_json_if_changed(&cached_profile_path, &serde_json::to_vec_pretty(&profile)?).await?;
 
     Ok(profile)
 }
 
 /// Computes the NeoForge version prefix corresponding to a Minecraft release version:
+/// - `"1.20.1"` -> `Some("1.20.1-")`
 /// - `"1.20.2"` -> `Some("20.2.")`
-/// - `"1.20.4"` -> `Some("20.4.")`
 /// - `"1.21"`   -> `Some("21.0.")`
-/// - `"1.21.1"` -> `Some("21.1.")`
 /// - `"1.21.4"` -> `Some("21.4.")`
+/// - `"26.1"`   -> `Some("26.1.0.")` (year-based `>= 26.x` versioning)
+/// - `"26.1.2"` -> `Some("26.1.2.")`
 pub fn neoforge_version_prefix(mc_version: &str) -> Option<String> {
     let trimmed = mc_version.trim();
     if trimmed == "1.20.1" {
@@ -141,7 +156,11 @@ pub fn neoforge_version_prefix(mc_version: &str) -> Option<String> {
     }
 
     if let Some(rest) = trimmed.strip_prefix("1.") {
-        let parts: Vec<&str> = rest.split('.').collect();
+        let base = rest
+            .split_once('-')
+            .map(|(b, _)| b)
+            .unwrap_or(rest);
+        let parts: Vec<&str> = base.split('.').collect();
         let minor = parts.first()?.trim();
         if minor.is_empty() || !minor.chars().all(|c| c.is_ascii_digit()) {
             return None;
@@ -149,9 +168,31 @@ pub fn neoforge_version_prefix(mc_version: &str) -> Option<String> {
         let patch = parts
             .get(1)
             .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
             .unwrap_or("0");
         return Some(format!("{minor}.{patch}."));
+    }
+
+    // Year-based Minecraft releases (`>= 26.x`, e.g. `26.1` -> `26.1.0.`, `26.1.2` -> `26.1.2.`)
+    let base = trimmed
+        .split_once('-')
+        .map(|(b, _)| b)
+        .unwrap_or(trimmed);
+    let parts: Vec<&str> = base.split('.').collect();
+    if parts.len() >= 2 {
+        let year: u32 = parts[0].trim().parse().ok()?;
+        if year >= 26 {
+            let drop_seg = parts[1].trim();
+            if drop_seg.is_empty() || !drop_seg.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let hotfix_seg = parts
+                .get(2)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+                .unwrap_or("0");
+            return Some(format!("{year}.{drop_seg}.{hotfix_seg}."));
+        }
     }
 
     None
@@ -197,7 +238,14 @@ pub async fn resolve_neoforge_version(
     )
     .await?;
 
-    select_modern_neoforge_build(&all_versions, mc_trimmed, &prefix, build, is_latest, is_recommended)
+    select_modern_neoforge_build(
+        &all_versions,
+        mc_trimmed,
+        &prefix,
+        build,
+        is_latest,
+        is_recommended,
+    )
 }
 
 /// Selects the matching NeoForge 1.20.1 (`net.neoforged:forge`) build version.
@@ -252,7 +300,7 @@ pub fn select_neoforge_1_20_1_build(
     Ok(matching.pop().unwrap())
 }
 
-/// Selects the matching modern NeoForge (`1.20.2` – `1.21+`, `net.neoforged:neoforge`) build version.
+/// Selects the matching modern NeoForge (`1.20.2` – `26.x+`, `net.neoforged:neoforge`) build version.
 pub fn select_modern_neoforge_build(
     all_versions: &[String],
     mc_version: &str,
